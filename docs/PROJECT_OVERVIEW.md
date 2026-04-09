@@ -2,7 +2,7 @@
 
 **Created**: March 31, 2026
 **Version**: 0.1.0 (Development)
-**Status**: Phase 1 - PoC in Progress
+**Status**: Phase B Complete + Robustness Hardening Done
 
 ---
 
@@ -208,29 +208,123 @@ Build an automated Liquidity Provider agent for Meteora DLMM that targets new to
 - ✅ Package.json configured
 - ✅ TypeScript setup
 - ✅ Documentation framework
-- ⏳ Starting Option A implementation
+
+### April 1–5, 2026 - Phase A & B Implementation
+- ✅ 4-tier token scanner (`src/scanner/`)
+  - Tier 1: mint/freeze authority, supply check
+  - Tier 2: volume, liquidity, buy/sell ratio
+  - Tier 3: price action & volatility
+  - Tier 4: smart money signals (Jupiter, Birdeye listing)
+- ✅ DLMM pool integration (`src/core/dlmm.pool.ts`)
+- ✅ Position manager: open, update, close (paper + live)
+- ✅ Rebalancer: auto-rebalance out-of-range positions
+- ✅ Pool discovery via DexScreener + on-chain validation
+- ✅ Database persistence (SQLite via `position.db.ts`)
+- ✅ Telegram alerts + interactive bot flow
+- ✅ Systemd service for 24/7 operation
+
+### April 6–8, 2026 - Telegram Interactive Flow + Memory System
+- ✅ Full interactive Telegram commands:
+  - `/dlmm` — scan candidates → strategy selection → token entry
+  - `/positions` — live position status
+  - `/claim` — claim swap fees
+  - `/compound` — compound fees back into position
+  - `/lessons` — view performance lessons
+  - `/strategies` — list/select strategy presets
+  - `/blacklist` — manage token/deployer blacklist
+- ✅ Memory system (`src/memory/`):
+  - `pool.memory.ts` — per-pool score, cooldown tracking, close history
+  - `lessons.ts` — performance lesson recorder + summary
+  - `blacklist.ts` — token & deployer blacklist (persist to `data/`)
+  - `strategy.library.ts` — reusable LP strategy presets
+- ✅ Background volume scanner with auto-alert
+- ✅ All-in capital strategy (full capital per position)
+- ✅ Integration test suite + paper trading simulator
+- ✅ Fee claim & compound (paper + live on-chain)
+
+### April 9, 2026 - Robustness Hardening (commit `a197bfc`)
+- ✅ **Fix 1: `getLbPairs()` bottleneck eliminated**
+  - `pool.discovery.ts` & `dlmm.pool.ts`: DexScreener HTTP fast path first
+  - On-chain fallback with 12s `Promise.race()` hard timeout
+  - Module-level 5-min cache → no double-fetching within same process
+- ✅ **Fix 2: `.gitignore` runtime data files**
+  - `data/lessons.json`, `data/pool-memory.json`, `data/positions.json` excluded
+  - `data/deployer-blacklist.json` retained as seed file
+- ✅ **Fix 3: SafetyChecker Tier 2 holder checks**
+  - `runTier2Checks()`: `getTokenLargestAccounts` on-chain
+  - Critical: single holder > 20% → `passed = false`
+  - Warning: top-10 > 50% supply → warning, non-blocking
+  - Network failure → non-fatal warning, agent continues
+- ✅ **Fix 4: `validateConfig()` hardened**
+  - Validate all numeric thresholds at startup
+  - Hard errors (agent stops) vs warnings (agent continues)
+  - Startup config summary printed on every launch
+
+---
+
+## 🗂️ Current File Structure
+
+```
+src/
+  config/constants.ts       — all env config + validateConfig()
+  core/
+    connection.ts           — RPC connection manager
+    dlmm.pool.ts            — pool reader + analyzePool()
+  scanner/
+    token.scanner.ts        — 4-tier scanning orchestrator
+    safety.checker.ts       — Tier 1+2 on-chain safety (Tier 2 added)
+    pool.discovery.ts       — DexScreener + on-chain pool discovery
+    volume.scanner.ts       — background high-volume alert scanner
+    volume.analyzer.ts      — 24h volume metrics
+    metadata.fetcher.ts     — token metadata fetcher
+    price.analyzer.ts       — Tier 3 price action
+    smart.signals.ts        — Tier 4 smart money signals
+  strategy/
+    agent.ts                — main orchestrator + main loop
+    position.manager.ts     — position lifecycle (open/update/close/claim/compound)
+    rebalancer.ts           — out-of-range rebalance logic
+  memory/
+    pool.memory.ts          — per-pool score + cooldown
+    lessons.ts              — trade lessons + win rate tracking
+    blacklist.ts            — token/deployer blacklist
+    strategy.library.ts     — LP strategy presets
+  database/position.db.ts   — SQLite persistence
+  notifications/
+    telegram.alert.ts       — bot alerts + interactive command handlers
+  utils/logger.ts           — winston logger
+  index.ts                  — entry point
+tests/
+  integration.ts            — full cycle integration test
+  paper.trading.ts          — paper trading simulation
+  test.scanner.ts / tier2 / tier34
+data/
+  deployer-blacklist.json   — seed blacklist (tracked in git)
+  lessons.json              — runtime (gitignored)
+  pool-memory.json          — runtime (gitignored)
+  positions.json            — runtime (gitignored)
+```
 
 ---
 
 ## 🎯 Next Steps
 
-1. ✅ Complete Option A PoC (today)
-2. Document PoC results
-3. Begin Option C (token scanner)
-4. Implement Tier 1-4 filters
-5. Test with real market data
-6. Move to Option B (foundation)
+1. Run paper trading test end-to-end dengan real RPC
+2. Konfigurasi `.env` production (Helius key + Telegram bot)
+3. Monitor 24h paper trading run, review lessons output
+4. Evaluasi apakah siap switch ke live trading
+5. (Optional) Tambah Tier 3+4 checks ke SafetyChecker standalone
 
 ---
 
 ## 📞 Contact & Support
 
 For questions or issues, refer to:
-- `/docs/architecture.md` - System design
-- `/docs/safety-filters.md` - Token screening details
-- `/docs/troubleshooting.md` - Common issues
+- `/docs/PHASE-1-POC.md` — initial PoC results
+- `/docs/PHASE-2-TIER2.md` — Tier 2 scanner docs
+- `/docs/PHASE-3-TIER34.md` — Tier 3 & 4 docs
+- `/docs/POC-RESULTS.md` — benchmark results
 
 ---
 
-**Last Updated**: March 31, 2026
-**Next Review**: After Option A completion
+**Last Updated**: April 9, 2026
+**Next Review**: After paper trading validation run
