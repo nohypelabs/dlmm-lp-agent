@@ -36,7 +36,7 @@ async function main() {
     logger.info(`\n🔍 Scanning ${tokenAddresses.length} tokens with Tier 2 analysis...`);
     logger.info('This will fetch volume & liquidity data from APIs...\n');
 
-    const candidates = await scanner.scanTokens(tokenAddresses, true); // Include Tier 2
+    const candidates = await scanner.scanTokens(tokenAddresses, { includeTier2: true }); // Include Tier 2
 
     logger.info(`\n\n📊 SCAN RESULTS (TIER 1 + TIER 2)`);
     logger.info('='.repeat(60));

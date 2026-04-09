@@ -17,6 +17,7 @@ import axios from 'axios';
 import { logger } from '../utils/logger';
 import { TOKEN_FILTERS } from '../config/constants';
 import { TokenScanner, TokenCandidate } from './token.scanner';
+import { isTokenBlocked } from '../memory/blacklist';
 
 const DEXSCREENER_API = 'https://api.dexscreener.com';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
@@ -117,6 +118,7 @@ export class PoolDiscovery {
     logger.info(`[PoolDiscovery] ${uniqueTokens.length} unique tokens after dedup`);
 
     // Step 4: For each token, find & validate Meteora DLMM pool on-chain
+    // Rate-limit: 600ms between tokens to avoid RPC 429s on public endpoints
     const validated: DiscoveredCandidate[] = [];
 
     for (const pair of uniqueTokens) {
@@ -134,6 +136,9 @@ export class PoolDiscovery {
         validated.push(candidate);
         logger.info(`[PoolDiscovery] ✅ ${candidate.symbol}: DLMM pool valid, score=${candidate.score}`);
       }
+
+      // Throttle between tokens to avoid public RPC rate limits
+      await new Promise(r => setTimeout(r, 600));
     }
 
     // Step 5: Sort by score desc, take top N
@@ -290,6 +295,12 @@ export class PoolDiscovery {
     const now = Date.now();
     const ageDays = (now - pair.pairCreatedAt) / (24 * 60 * 60 * 1000);
 
+    // Blacklist check — skip before any RPC calls
+    if (isTokenBlocked(mintAddress)) {
+      logger.debug(`[PoolDiscovery] ❌ ${pair.baseToken.symbol} (${mintAddress.slice(0, 8)}...) is blacklisted — skipping`);
+      return null;
+    }
+
     // First: try using the DexScreener pairAddress directly if it's a Meteora pair
     let validPoolAddress: string | null = null;
 
@@ -341,16 +352,24 @@ export class PoolDiscovery {
 
   /**
    * Validate that a pool address is actually a Meteora DLMM pool.
+   * Retries once after 1s on failure to handle transient 429s.
    */
   private async validateDlmmPool(poolAddress: string): Promise<boolean> {
-    try {
-      const dlmmPool = await DLMM.create(this.connection, new PublicKey(poolAddress));
-      // If we can get active bin, it's a valid DLMM pool
-      await dlmmPool.getActiveBin();
-      return true;
-    } catch {
-      return false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const dlmmPool = await DLMM.create(this.connection, new PublicKey(poolAddress));
+        await dlmmPool.getActiveBin();
+        return true;
+      } catch (err: any) {
+        const is429 = err?.message?.includes('429') || err?.message?.includes('Too Many');
+        if (is429 && attempt === 0) {
+          await new Promise(r => setTimeout(r, 1500));
+          continue;
+        }
+        return false;
+      }
     }
+    return false;
   }
 
   /**

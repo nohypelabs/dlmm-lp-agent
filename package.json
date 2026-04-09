@@ -8,6 +8,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "test": "ts-node tests/paper.trading.ts",
+    "test:integration": "ts-node tests/integration.ts",
     "test:scanner": "ts-node tests/test.scanner.ts",
     "test:tier2": "ts-node tests/test.tier2.ts",
     "test:tier34": "ts-node tests/test.tier34.ts",

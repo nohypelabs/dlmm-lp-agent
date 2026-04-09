@@ -7,6 +7,7 @@ import { Connection, PublicKey } from '@solana/web3.js';
 import { getMint, getAccount } from '@solana/spl-token';
 import { logger } from '../utils/logger';
 import { TOKEN_FILTERS } from '../config/constants';
+import { isTokenBlocked } from '../memory/blacklist';
 
 export interface SafetyCheckResult {
   passed: boolean;
@@ -44,6 +45,20 @@ export class SafetyChecker {
     };
 
     try {
+      // BLACKLIST CHECK: instant reject before any on-chain calls
+      if (isTokenBlocked(mintAddress)) {
+        logger.warn(`Token ${mintAddress} is blacklisted — instant reject`);
+        result.errors.push('Token blacklisted');
+        result.checks['blacklist'] = {
+          passed: false,
+          message: 'Token is on the deployer blacklist',
+          critical: true,
+        };
+        result.score = 0;
+        result.passed = false;
+        return result;
+      }
+
       logger.info(`Running safety check for token: ${mintAddress}`);
 
       const mintPubkey = new PublicKey(mintAddress);

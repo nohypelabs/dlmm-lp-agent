@@ -31,6 +31,9 @@ import * as telegram from '../notifications/telegram.alert';
 import { registerCommandHandlers, startCommandPolling, stopCommandPolling } from '../notifications/telegram.alert';
 import { PoolDiscovery, DiscoveredCandidate } from '../scanner/pool.discovery';
 import { scanHighVolume, shouldAlert, markAlerted, formatTokenAlert } from '../scanner/volume.scanner';
+import * as poolMemory from '../memory/pool.memory';
+import { recordPositionClose, formatLessonsForTelegram, getPerformanceSummary } from '../memory/lessons';
+import { LPStrategy, getDefaultPreset } from '../memory/strategy.library';
 
 export interface AgentStatus {
   running: boolean;
@@ -111,8 +114,13 @@ export class DLMMAgent {
     logger.info(`  Risk: -${STRATEGY_CONFIG.MAX_LOSS_PERCENT}% max loss, -${STRATEGY_CONFIG.MAX_IL_PERCENT}% max IL`);
     logger.info('='.repeat(50));
 
+    const perf = getPerformanceSummary();
+    const perfMsg = perf.totalTrades > 0
+      ? `\nHistory: ${perf.totalTrades} trades | WR: ${(perf.winRate * 100).toFixed(0)}% | Avg PnL: ${perf.avgPnlPercent.toFixed(1)}%`
+      : '';
+
     await telegram.sendAlert(
-      `🤖 <b>DLMM LP Agent Started</b>\nMode: ${mode}\nCapital: $${STRATEGY_CONFIG.STARTING_CAPITAL}\nMax Positions: ${STRATEGY_CONFIG.MAX_POSITIONS}\nTarget: +${STRATEGY_CONFIG.PROFIT_TARGET_PERCENT}%\nMax Re-entry: ${STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN}x per token`,
+      `🤖 <b>DLMM LP Agent Started</b>\nMode: ${mode}\nCapital: $${STRATEGY_CONFIG.STARTING_CAPITAL}\nMax Positions: ${STRATEGY_CONFIG.MAX_POSITIONS}\nTarget: +${STRATEGY_CONFIG.PROFIT_TARGET_PERCENT}%\nMax Re-entry: ${STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN}x per token${perfMsg}`,
     );
 
     // Start Telegram command listener with scan & entry providers
@@ -120,7 +128,9 @@ export class DLMMAgent {
       () => this.getStatus(),
       () => this.positionManager.getOpenPositions(),
       () => this.scanCandidatesForTelegram(),
-      (poolAddress, mintAddress, symbol) => this.enterFromTelegram(poolAddress, mintAddress, symbol),
+      (poolAddress, mintAddress, symbol, strategy) => this.enterFromTelegram(poolAddress, mintAddress, symbol, strategy),
+      (positionId) => this.positionManager.claimFees(positionId),
+      (positionId) => this.positionManager.compoundFees(positionId),
     );
     startCommandPolling();
 
@@ -162,8 +172,11 @@ export class DLMMAgent {
         await telegram.sendAlert(
           `🎯 <b>TARGET HIT!</b>\nPosition: ${pos.id.slice(0, 16)}...\nPnL: +${pos.pnlPercent.toFixed(2)}%\nValue: $${pos.currentValueUsd.toFixed(2)}\nFees: $${pos.feesEarned.toFixed(4)}\n\nAuto-closing position...`,
         );
-        const closed = await this.positionManager.closePosition(pos.id);
-        if (closed) await telegram.notifyPositionClosed(closed);
+        const closed = await this.positionManager.closePosition(pos.id, 'take_profit');
+        if (closed) {
+          await telegram.notifyPositionClosed(closed);
+          this.recordClose(closed);
+        }
       }
     }
 
@@ -172,8 +185,12 @@ export class DLMMAgent {
     for (const alert of alerts) {
       logger.warn(`RISK ALERT: ${alert.reason}`);
       await telegram.notifyRiskAlert(alert.positionId, alert.reason);
-      const closed = await this.positionManager.closePosition(alert.positionId);
-      if (closed) await telegram.notifyPositionClosed(closed);
+      const exitReason = alert.reason.includes('IL') ? 'il_limit' : 'stop_loss';
+      const closed = await this.positionManager.closePosition(alert.positionId, exitReason);
+      if (closed) {
+        await telegram.notifyPositionClosed(closed);
+        this.recordClose(closed);
+      }
     }
 
     // 4. Rebalance existing positions
@@ -230,10 +247,23 @@ export class DLMMAgent {
           .find(p => p.poolAddress === candidate.poolAddress);
         if (existing) continue;
 
+        // Skip pools on cooldown (bad recent exit)
+        if (poolMemory.isOnCooldown(candidate.poolAddress)) {
+          logger.info(`Skipping ${candidate.symbol}: pool on cooldown`);
+          continue;
+        }
+
         // Check re-entry limit per token (max 3x entry for same token)
         const entryCount = this.tokenEntryCount.get(candidate.mintAddress) || 0;
         if (entryCount >= STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN) {
           logger.info(`Skipping ${candidate.symbol}: max re-entries reached (${entryCount}/${STRATEGY_CONFIG.MAX_REENTRY_PER_TOKEN})`);
+          continue;
+        }
+
+        // Log pool memory score for transparency
+        const memScore = poolMemory.getPoolScore(candidate.poolAddress);
+        if (memScore < 30) {
+          logger.info(`Skipping ${candidate.symbol}: low pool memory score (${memScore}/100)`);
           continue;
         }
 
@@ -248,6 +278,7 @@ export class DLMMAgent {
           positionSize,
           analysis.suggestedRange.min,
           analysis.suggestedRange.max,
+          candidate.symbol,
         );
 
         if (position) {
@@ -331,8 +362,9 @@ export class DLMMAgent {
   /**
    * Enter a position from Telegram user selection.
    */
-  async enterFromTelegram(poolAddress: string, mintAddress: string, symbol: string): Promise<boolean> {
-    logger.info(`[Telegram] User selected entry: ${symbol} (${poolAddress})`);
+  async enterFromTelegram(poolAddress: string, mintAddress: string, symbol: string, strategy?: LPStrategy): Promise<boolean> {
+    const resolvedStrategy = strategy ?? getDefaultPreset();
+    logger.info(`[Telegram] User selected entry: ${symbol} (${poolAddress}) | Strategy: ${resolvedStrategy.id}`);
 
     // Check if we have room
     const openPositions = this.positionManager.getOpenPositions();
@@ -356,6 +388,13 @@ export class DLMMAgent {
         return false;
       }
 
+      // Check pool cooldown before Telegram entry too
+      if (poolMemory.isOnCooldown(poolAddress)) {
+        logger.warn(`[Telegram] Pool ${symbol} is on cooldown — entry blocked`);
+        await telegram.sendAlert(`⛔ <b>${symbol}</b> pool is on cooldown (recent bad exit). Try another token.`);
+        return false;
+      }
+
       // All-in entry
       const positionSize = STRATEGY_CONFIG.STARTING_CAPITAL;
       const position = await this.positionManager.openPosition(
@@ -363,6 +402,8 @@ export class DLMMAgent {
         positionSize,
         analysis.suggestedRange.min,
         analysis.suggestedRange.max,
+        symbol,
+        resolvedStrategy,
       );
 
       if (position) {
@@ -388,6 +429,36 @@ export class DLMMAgent {
     logger.info('Stopping agent...');
     this.running = false;
     stopCommandPolling();
+  }
+
+  /**
+   * Record a closed position into pool memory + lessons system.
+   */
+  private recordClose(pos: Position): void {
+    const symbol = pos.tokenSymbol ?? pos.tokenX.slice(0, 8);
+    const reason = pos.exitReason ?? 'manual';
+
+    poolMemory.recordClose({
+      poolAddress:   pos.poolAddress,
+      tokenSymbol:   symbol,
+      positionId:    pos.id,
+      entryTime:     pos.entryTime,
+      exitTime:      Date.now(),
+      entryPrice:    pos.entryPrice,
+      exitPrice:     pos.currentPrice,
+      pnlPercent:    pos.pnlPercent,
+      feesEarned:    pos.feesEarned,
+      exitReason:    reason,
+    });
+
+    recordPositionClose({
+      tokenSymbol:  symbol,
+      poolAddress:  pos.poolAddress,
+      pnlPercent:   pos.pnlPercent,
+      feesEarned:   pos.feesEarned,
+      durationMs:   Date.now() - pos.entryTime,
+      exitReason:   reason,
+    });
   }
 
   private sleep(ms: number): Promise<void> {
