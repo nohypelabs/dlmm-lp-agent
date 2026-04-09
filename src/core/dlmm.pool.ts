@@ -11,8 +11,15 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import DLMM from '@meteora-ag/dlmm';
 import BN from 'bn.js';
+import axios from 'axios';
 import { logger } from '../utils/logger';
 import { DLMM_CONFIG } from '../config/constants';
+
+const DEXSCREENER_API = 'https://api.dexscreener.com';
+
+// Module-level cache for getLbPairs (shared with pool.discovery to avoid double-fetching)
+const LB_PAIRS_CACHE_TTL_MS = 5 * 60 * 1000;
+let lbPairsCache: { pairs: Awaited<ReturnType<typeof DLMM.getLbPairs>>; expiresAt: number } | null = null;
 
 export interface PoolInfo {
   address: string;
@@ -50,15 +57,62 @@ export class DLMMPoolReader {
   }
 
   /**
-   * Find DLMM pools for a token pair
+   * Find DLMM pools for a token pair.
+   *
+   * Fast path: DexScreener token API lookup (HTTP, no RPC).
+   * Slow fallback: on-chain getLbPairs with 12s timeout + 5-min module cache.
    */
   async findPools(tokenMintA: string, tokenMintB: string): Promise<string[]> {
+    logger.info(`Searching DLMM pools for ${tokenMintA.slice(0, 8)}... / ${tokenMintB.slice(0, 8)}...`);
+
+    // Fast path: query DexScreener for tokenMintA, filter for Meteora pairs
+    const dsResults = await this.findPoolsViaDexScreener(tokenMintA, tokenMintB);
+    if (dsResults.length > 0) return dsResults;
+
+    // Slow fallback: on-chain with cache + timeout
+    return this.findPoolsOnChain(tokenMintA, tokenMintB);
+  }
+
+  private async findPoolsViaDexScreener(tokenMintA: string, tokenMintB: string): Promise<string[]> {
     try {
-      logger.info(`Searching DLMM pools for ${tokenMintA.slice(0, 8)}... / ${tokenMintB.slice(0, 8)}...`);
+      const resp = await axios.get(
+        `${DEXSCREENER_API}/tokens/v1/solana/${tokenMintA}`,
+        { timeout: 8_000 },
+      );
+      const data: Array<{ chainId: string; dexId?: string; pairAddress: string; quoteToken?: { address: string } }> =
+        Array.isArray(resp.data) ? resp.data : (resp.data?.pairs ?? []);
 
-      const pairs = await DLMM.getLbPairs(this.connection);
+      const matching = data.filter(p =>
+        p.chainId === 'solana' &&
+        p.dexId?.toLowerCase().includes('meteora') &&
+        (p.quoteToken?.address === tokenMintB || tokenMintB === ''),
+      );
 
-      const matching = pairs.filter(p => {
+      return matching.map(p => p.pairAddress).slice(0, 5);
+    } catch {
+      return [];
+    }
+  }
+
+  private async findPoolsOnChain(tokenMintA: string, tokenMintB: string): Promise<string[]> {
+    try {
+      let allPairs = lbPairsCache && Date.now() < lbPairsCache.expiresAt
+        ? lbPairsCache.pairs
+        : null;
+
+      if (!allPairs) {
+        logger.debug('[DLMMPoolReader] Fetching all LB pairs on-chain (slow — up to 12s)...');
+        allPairs = await Promise.race([
+          DLMM.getLbPairs(this.connection),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('getLbPairs timeout after 12s')), 12_000),
+          ),
+        ]);
+        lbPairsCache = { pairs: allPairs, expiresAt: Date.now() + LB_PAIRS_CACHE_TTL_MS };
+        logger.debug(`[DLMMPoolReader] LB pairs cached: ${allPairs.length} pairs (TTL 5min)`);
+      }
+
+      const matching = allPairs.filter(p => {
         const xMint = p.account.tokenXMint.toBase58();
         const yMint = p.account.tokenYMint.toBase58();
         return (
@@ -67,9 +121,8 @@ export class DLMMPoolReader {
         );
       });
 
-      const addresses = matching.map(p => p.publicKey.toBase58());
-      logger.info(`Found ${addresses.length} DLMM pools`);
-      return addresses;
+      logger.info(`Found ${matching.length} DLMM pools`);
+      return matching.map(p => p.publicKey.toBase58());
     } catch (error) {
       logger.error(`Failed to find pools: ${error}`);
       return [];

@@ -4,7 +4,7 @@
  */
 
 import { Connection, PublicKey } from '@solana/web3.js';
-import { getMint, getAccount } from '@solana/spl-token';
+import { getMint } from '@solana/spl-token';
 import { logger } from '../utils/logger';
 import { TOKEN_FILTERS } from '../config/constants';
 import { isTokenBlocked } from '../memory/blacklist';
@@ -71,11 +71,24 @@ export class SafetyChecker {
         return result;
       }
 
-      // Calculate score based on checks
+      // TIER 2: DISTRIBUTION CHECKS (Warnings + scoring)
+      await this.runTier2Checks(mintPubkey, result);
+
+      // Calculate score based on all checks
       result.score = this.calculateScore(result);
       result.tier = this.determineTier(result.score);
 
+      // Re-evaluate passed flag: fail if any critical Tier 2 check failed
+      const anyCriticalFailed = Object.values(result.checks)
+        .some(c => c.critical && !c.passed);
+      if (anyCriticalFailed) {
+        result.passed = false;
+      }
+
       logger.info(`Token ${mintAddress} safety score: ${result.score}/100 (Tier ${result.tier})`);
+      if (result.warnings.length > 0) {
+        logger.debug(`Warnings: ${result.warnings.join('; ')}`);
+      }
 
       return result;
     } catch (error) {
@@ -163,6 +176,77 @@ export class SafetyChecker {
       logger.error('Error in Tier 1 checks', error);
       result.errors.push(`Tier 1 check error: ${error}`);
       result.passed = false;
+    }
+  }
+
+  /**
+   * TIER 2: Distribution & Concentration Checks
+   * Non-fatal by default, but single-holder dominance is critical.
+   */
+  private async runTier2Checks(
+    mintPubkey: PublicKey,
+    result: SafetyCheckResult,
+  ): Promise<void> {
+    try {
+      const [mintInfo, largestAccounts] = await Promise.all([
+        getMint(this.connection, mintPubkey),
+        this.connection.getTokenLargestAccounts(mintPubkey),
+      ]);
+
+      const totalSupply = Number(mintInfo.supply);
+      const holders = largestAccounts.value;
+
+      if (totalSupply <= 0 || holders.length === 0) {
+        result.warnings.push('Could not fetch holder distribution');
+        return;
+      }
+
+      // Check 1: Single largest holder must not dominate
+      const largestHolder = holders[0];
+      const largestPct = (Number(largestHolder.amount) / totalSupply) * 100;
+      const maxPct = TOKEN_FILTERS.MAX_TOP_HOLDER_PERCENT;
+      const topHolderOk = largestPct <= maxPct;
+
+      result.checks['top_holder_limit'] = {
+        passed: topHolderOk,
+        message: topHolderOk
+          ? `Largest holder: ${largestPct.toFixed(1)}% (≤${maxPct}% limit)`
+          : `Largest holder: ${largestPct.toFixed(1)}% EXCEEDS ${maxPct}% limit (rug risk)`,
+        critical: true, // single whale is a rug signal
+      };
+      if (!topHolderOk) {
+        result.errors.push(
+          `Single holder controls ${largestPct.toFixed(1)}% of supply — rug risk`,
+        );
+      }
+
+      // Check 2: Top 10 holder concentration (warning only)
+      const top10Total = holders
+        .slice(0, 10)
+        .reduce((sum, acc) => sum + Number(acc.amount), 0);
+      const top10Pct = (top10Total / totalSupply) * 100;
+      const concentrationOk = top10Pct <= 50;
+
+      result.checks['holder_concentration'] = {
+        passed: concentrationOk,
+        message: concentrationOk
+          ? `Top 10 holders: ${top10Pct.toFixed(1)}% (acceptable)`
+          : `Top 10 holders: ${top10Pct.toFixed(1)}% — high concentration risk`,
+        critical: false,
+      };
+      if (!concentrationOk) {
+        result.warnings.push(
+          `Top 10 holders control ${top10Pct.toFixed(1)}% of supply`,
+        );
+      }
+
+      logger.debug(
+        `Tier 2: largest holder ${largestPct.toFixed(1)}%, top-10 ${top10Pct.toFixed(1)}%`,
+      );
+    } catch (error) {
+      // Non-fatal: network issue should not block the whole check
+      logger.debug(`Tier 2 checks failed (non-fatal): ${error}`);
+      result.warnings.push('Holder distribution check unavailable (network)');
     }
   }
 

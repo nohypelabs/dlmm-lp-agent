@@ -135,22 +135,69 @@ export const TIME_CONSTANTS = {
 // Validation
 export const validateConfig = (): boolean => {
   const errors: string[] = [];
+  const warnings: string[] = [];
 
+  // ── Hard errors (agent will not start) ─────────────────────────
   if (!WALLET_CONFIG.PRIVATE_KEY && !OPERATION_MODE.PAPER_TRADING) {
-    errors.push('WALLET_PRIVATE_KEY is required for live trading');
+    errors.push('WALLET_PRIVATE_KEY is required for live trading (or set PAPER_TRADING=true)');
   }
-
   if (STRATEGY_CONFIG.STARTING_CAPITAL <= 0) {
-    errors.push('STARTING_CAPITAL must be greater than 0');
+    errors.push('STARTING_CAPITAL must be > 0');
   }
-
   if (STRATEGY_CONFIG.MAX_POSITIONS <= 0) {
-    errors.push('MAX_POSITIONS must be greater than 0');
+    errors.push('MAX_POSITIONS must be > 0');
+  }
+  if (STRATEGY_CONFIG.MAX_LOSS_PERCENT <= 0 || STRATEGY_CONFIG.MAX_LOSS_PERCENT > 100) {
+    errors.push('MAX_LOSS_PERCENT must be between 1 and 100');
+  }
+  if (STRATEGY_CONFIG.PROFIT_TARGET_PERCENT <= 0) {
+    errors.push('PROFIT_TARGET_PERCENT must be > 0');
+  }
+  if (TOKEN_FILTERS.MIN_TOKEN_AGE_DAYS < 0) {
+    errors.push('MIN_TOKEN_AGE_DAYS must be >= 0');
+  }
+  if (TOKEN_FILTERS.MIN_DAILY_VOLUME <= 0) {
+    errors.push('MIN_DAILY_VOLUME must be > 0');
   }
 
+  // ── Warnings (agent starts but may work poorly) ─────────────────
+  if (!SOLANA_CONFIG.HELIUS_API_KEY) {
+    warnings.push(
+      'HELIUS_API_KEY not set — using public RPC (rate-limited, expect slowness)',
+    );
+  }
+  if (!TELEGRAM_CONFIG.ENABLED) {
+    warnings.push('Telegram not configured — no real-time alerts (set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID)');
+  }
+  if (OPERATION_MODE.PAPER_TRADING) {
+    warnings.push('PAPER_TRADING=true — simulated mode, no real funds used');
+  }
+  if (
+    !OPERATION_MODE.PAPER_TRADING &&
+    STRATEGY_CONFIG.STARTING_CAPITAL > 500
+  ) {
+    warnings.push(
+      `Large capital deployed: $${STRATEGY_CONFIG.STARTING_CAPITAL} — ensure this is intentional`,
+    );
+  }
+
+  // ── Print summary ───────────────────────────────────────────────
+  console.log('\n── Config Validation ──────────────────────────');
+  console.log(`  Mode      : ${OPERATION_MODE.PAPER_TRADING ? 'PAPER' : 'LIVE'} (${OPERATION_MODE.MODE})`);
+  console.log(`  Capital   : $${STRATEGY_CONFIG.STARTING_CAPITAL} | Positions: ${STRATEGY_CONFIG.MAX_POSITIONS}`);
+  console.log(`  Target    : +${STRATEGY_CONFIG.PROFIT_TARGET_PERCENT}% | Stop: -${STRATEGY_CONFIG.MAX_LOSS_PERCENT}% | Max IL: -${STRATEGY_CONFIG.MAX_IL_PERCENT}%`);
+  console.log(`  RPC       : ${SOLANA_CONFIG.HELIUS_API_KEY ? 'Helius (fast)' : 'Public (slow)'}`);
+  console.log(`  Telegram  : ${TELEGRAM_CONFIG.ENABLED ? 'enabled' : 'disabled'}`);
+  console.log('───────────────────────────────────────────────\n');
+
+  if (warnings.length > 0) {
+    warnings.forEach(w => console.warn(`  ⚠  ${w}`));
+    console.log('');
+  }
   if (errors.length > 0) {
-    console.error('Configuration errors:');
-    errors.forEach(err => console.error(`  - ${err}`));
+    console.error('Configuration errors — agent will not start:');
+    errors.forEach(err => console.error(`  ✗  ${err}`));
+    console.log('');
     return false;
   }
 

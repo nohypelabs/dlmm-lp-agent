@@ -22,6 +22,11 @@ import { isTokenBlocked } from '../memory/blacklist';
 const DEXSCREENER_API = 'https://api.dexscreener.com';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
+// Module-level cache for getLbPairs — shared across all PoolDiscovery instances
+// to avoid repeated slow on-chain fetches within the same process lifetime.
+const LB_PAIRS_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+let lbPairsCache: { pairs: Awaited<ReturnType<typeof DLMM.getLbPairs>>; expiresAt: number } | null = null;
+
 /** Raw pair record returned by DexScreener. */
 interface DexScreenerPair {
   chainId: string;
@@ -374,12 +379,79 @@ export class PoolDiscovery {
 
   /**
    * Search for a Meteora DLMM pool for a given token mint.
-   * Tries token/SOL pair first (most common for memecoins).
+   *
+   * Fast path: query DexScreener token API (HTTP, no RPC cost).
+   * Slow fallback: on-chain getLbPairs with a hard 12s timeout and
+   *                module-level 5-minute result cache.
    */
   private async findDlmmPoolForToken(tokenMint: string): Promise<string | null> {
+    // Fast path: DexScreener token lookup → no RPC calls
     try {
-      // Get all DLMM pairs and find ones that match this token
-      const allPairs = await DLMM.getLbPairs(this.connection);
+      const result = await this.findDlmmPoolViaDexScreener(tokenMint);
+      if (result) return result;
+    } catch {
+      logger.debug(`[PoolDiscovery] DexScreener lookup failed for ${tokenMint.slice(0, 8)}...`);
+    }
+
+    // Slow fallback: on-chain with timeout + cache
+    return this.findDlmmPoolOnChain(tokenMint);
+  }
+
+  /**
+   * Query DexScreener for this token's pairs, then filter for Meteora DLMM ones.
+   * Validates each candidate on-chain before returning.
+   */
+  private async findDlmmPoolViaDexScreener(tokenMint: string): Promise<string | null> {
+    const resp = await axios.get(
+      `${DEXSCREENER_API}/tokens/v1/solana/${tokenMint}`,
+      { timeout: 8_000 },
+    );
+    const data: DexScreenerPair[] = Array.isArray(resp.data)
+      ? resp.data
+      : (resp.data?.pairs ?? []);
+
+    const meteoraPairs = data
+      .filter(
+        p => p.chainId === 'solana' && p.dexId?.toLowerCase().includes('meteora'),
+      )
+      .sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0));
+
+    if (meteoraPairs.length === 0) return null;
+
+    for (const pair of meteoraPairs.slice(0, 3)) {
+      const isValid = await this.validateDlmmPool(pair.pairAddress);
+      if (isValid) {
+        logger.debug(
+          `[PoolDiscovery] DexScreener found DLMM pool for ${tokenMint.slice(0, 8)}...: ${pair.pairAddress.slice(0, 8)}...`,
+        );
+        return pair.pairAddress;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * On-chain fallback: fetch all LB pairs with a 12s hard timeout.
+   * Results are cached for 5 minutes at the module level to avoid
+   * redundant full-scan fetches within the same process.
+   */
+  private async findDlmmPoolOnChain(tokenMint: string): Promise<string | null> {
+    try {
+      let allPairs = lbPairsCache && Date.now() < lbPairsCache.expiresAt
+        ? lbPairsCache.pairs
+        : null;
+
+      if (!allPairs) {
+        logger.debug('[PoolDiscovery] Falling back to on-chain getLbPairs (slow — may take up to 12s)...');
+        allPairs = await Promise.race([
+          DLMM.getLbPairs(this.connection),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error('getLbPairs timeout after 12s')), 12_000),
+          ),
+        ]);
+        lbPairsCache = { pairs: allPairs, expiresAt: Date.now() + LB_PAIRS_CACHE_TTL_MS };
+        logger.debug(`[PoolDiscovery] LB pairs cached: ${allPairs.length} pairs (TTL 5min)`);
+      }
 
       const matching = allPairs.filter(p => {
         const xMint = p.account.tokenXMint.toBase58();
@@ -394,7 +466,6 @@ export class PoolDiscovery {
 
       if (matching.length === 0) return null;
 
-      // Prefer SOL pairs, validate the first match
       const solPair = matching.find(p => {
         const xMint = p.account.tokenXMint.toBase58();
         const yMint = p.account.tokenYMint.toBase58();
@@ -403,12 +474,10 @@ export class PoolDiscovery {
 
       const bestMatch = solPair || matching[0];
       const poolAddr = bestMatch.publicKey.toBase58();
-
-      // Validate it works
       const valid = await this.validateDlmmPool(poolAddr);
       return valid ? poolAddr : null;
     } catch (error) {
-      logger.debug(`[PoolDiscovery] DLMM pool search failed for ${tokenMint.slice(0, 8)}...: ${error}`);
+      logger.debug(`[PoolDiscovery] On-chain fallback failed for ${tokenMint.slice(0, 8)}...: ${error}`);
       return null;
     }
   }
