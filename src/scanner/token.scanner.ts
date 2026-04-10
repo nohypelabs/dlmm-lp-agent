@@ -64,7 +64,11 @@ export class TokenScanner {
       const safetyCheck = await this.safetyChecker.checkToken(mintAddress);
 
       if (!safetyCheck.passed) {
-        logger.warn(`Token ${metadata.symbol} failed Tier 1 safety check`);
+        const failedChecks = Object.entries(safetyCheck.checks)
+          .filter(([, c]) => !c.passed)
+          .map(([k, c]) => `${k}(${c.message})`)
+          .join(', ');
+        logger.warn(`Token ${metadata.symbol} failed safety: ${failedChecks}`);
         return null;
       }
 

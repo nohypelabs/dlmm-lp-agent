@@ -297,33 +297,40 @@ export class PoolDiscovery {
    */
   private async validateAndScore(pair: DexScreenerPair): Promise<DiscoveredCandidate | null> {
     const mintAddress = pair.baseToken.address;
+    const sym = pair.baseToken.symbol;
     const now = Date.now();
     const ageDays = (now - pair.pairCreatedAt) / (24 * 60 * 60 * 1000);
 
     // Blacklist check — skip before any RPC calls
     if (isTokenBlocked(mintAddress)) {
-      logger.debug(`[PoolDiscovery] ❌ ${pair.baseToken.symbol} (${mintAddress.slice(0, 8)}...) is blacklisted — skipping`);
+      logger.debug(`[PoolDiscovery] ❌ ${sym}: blacklisted`);
       return null;
     }
 
-    // First: try using the DexScreener pairAddress directly if it's a Meteora pair
+    const dexId = pair.dexId?.toLowerCase() ?? '';
     let validPoolAddress: string | null = null;
 
-    if (pair.dexId?.toLowerCase().includes('meteora')) {
-      // Validate on-chain that this is actually a DLMM pool
+    // Only attempt direct DLMM validation when DexScreener explicitly marks
+    // the pair as DLMM (dexId === 'meteora_dlmm').
+    // 'meteora' without '_dlmm' = DAMM / Stable pool — DLMM.create() will fail.
+    if (dexId === 'meteora_dlmm') {
       const isValid = await this.validateDlmmPool(pair.pairAddress);
       if (isValid) {
         validPoolAddress = pair.pairAddress;
+        logger.debug(`[PoolDiscovery] ✅ ${sym}: direct DLMM pool confirmed`);
+      } else {
+        logger.debug(`[PoolDiscovery]    ${sym}: direct pool invalid, searching...`);
       }
     }
 
-    // If not Meteora or validation failed, search for a DLMM pool for this token
+    // For DAMM pairs (dexId='meteora') or failed direct validation,
+    // search for an actual DLMM pool for this token.
     if (!validPoolAddress) {
       validPoolAddress = await this.findDlmmPoolForToken(mintAddress);
     }
 
     if (!validPoolAddress) {
-      logger.debug(`[PoolDiscovery] ❌ No valid DLMM pool for ${pair.baseToken.symbol} (${mintAddress.slice(0, 8)}...)`);
+      logger.info(`[PoolDiscovery] ❌ ${sym}: no DLMM pool found (dexId=${dexId})`);
       return null;
     }
 
@@ -335,9 +342,14 @@ export class PoolDiscovery {
         includeTier4: false,
       });
 
+      const score = candidate?.score ?? -1;
+      logger.info(
+        `[PoolDiscovery] ✅ ${sym}: pool=${validPoolAddress.slice(0, 8)}... score=${score} vol=$${((pair.volume?.h24 ?? 0) / 1000).toFixed(0)}K liq=$${((pair.liquidity?.usd ?? 0) / 1000).toFixed(0)}K`,
+      );
+
       return {
         mintAddress,
-        symbol: pair.baseToken.symbol,
+        symbol: sym,
         name: pair.baseToken.name,
         poolAddress: validPoolAddress,
         dexId: 'meteora_dlmm',
@@ -346,11 +358,11 @@ export class PoolDiscovery {
         ageDays,
         priceUsd: parseFloat(pair.priceUsd) || 0,
         fdv: pair.fdv ?? 0,
-        score: candidate?.score ?? -1,
+        score,
         candidate,
       };
     } catch (error) {
-      logger.error(`[PoolDiscovery] Scoring failed for ${mintAddress}: ${error}`);
+      logger.error(`[PoolDiscovery] Scoring failed for ${sym}: ${error}`);
       return null;
     }
   }
@@ -412,7 +424,8 @@ export class PoolDiscovery {
 
     const meteoraPairs = data
       .filter(
-        p => p.chainId === 'solana' && p.dexId?.toLowerCase().includes('meteora'),
+        // Only actual DLMM pairs — skip DAMM (dexId='meteora')
+        p => p.chainId === 'solana' && p.dexId?.toLowerCase() === 'meteora_dlmm',
       )
       .sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0));
 

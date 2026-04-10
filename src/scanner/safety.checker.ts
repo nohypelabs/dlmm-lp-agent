@@ -206,17 +206,24 @@ export class SafetyChecker {
       const largestPct = (Number(largestHolder.amount) / totalSupply) * 100;
       const maxPct = TOKEN_FILTERS.MAX_TOP_HOLDER_PERCENT;
       const topHolderOk = largestPct <= maxPct;
+      // Hard reject only if a single wallet controls >50% (clear rug/dev wallet).
+      // 20-50% gets a warning + score penalty — common in early memecoins.
+      const topHolderCritical = largestPct > 50;
 
       result.checks['top_holder_limit'] = {
         passed: topHolderOk,
         message: topHolderOk
           ? `Largest holder: ${largestPct.toFixed(1)}% (≤${maxPct}% limit)`
-          : `Largest holder: ${largestPct.toFixed(1)}% EXCEEDS ${maxPct}% limit (rug risk)`,
-        critical: true, // single whale is a rug signal
+          : `Largest holder: ${largestPct.toFixed(1)}% exceeds ${maxPct}% (${topHolderCritical ? 'CRITICAL' : 'warning'})`,
+        critical: topHolderCritical,
       };
-      if (!topHolderOk) {
+      if (topHolderCritical) {
         result.errors.push(
-          `Single holder controls ${largestPct.toFixed(1)}% of supply — rug risk`,
+          `Single holder controls ${largestPct.toFixed(1)}% of supply — likely dev/rug wallet`,
+        );
+      } else if (!topHolderOk) {
+        result.warnings.push(
+          `Largest holder ${largestPct.toFixed(1)}% > ${maxPct}% — concentrated but not critical`,
         );
       }
 
