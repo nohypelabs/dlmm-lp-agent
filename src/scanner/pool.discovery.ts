@@ -20,6 +20,7 @@ import { TokenScanner, TokenCandidate } from './token.scanner';
 import { isTokenBlocked } from '../memory/blacklist';
 
 const DEXSCREENER_API = 'https://api.dexscreener.com';
+const METEORA_DLMM_API = 'https://dlmm-api.meteora.ag';
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 
 // Module-level cache for getLbPairs — shared across all PoolDiscovery instances
@@ -102,7 +103,7 @@ export class PoolDiscovery {
       logger.warn('[PoolDiscovery] No memecoin pairs found');
       return [];
     }
-    logger.info(`[PoolDiscovery] Fetched ${pairs.length} memecoin pairs from DexScreener`);
+    logger.info(`[PoolDiscovery] Fetched ${pairs.length} pairs total (Meteora API + DexScreener)`);
 
     // Step 2: Filter by age, volume, liquidity
     const filtered = this.filterPairs(pairs);
@@ -161,100 +162,149 @@ export class PoolDiscovery {
   // ─── Fetching ──────────────────────────────────────────────────
 
   /**
-   * Fetch Solana memecoins from multiple DexScreener sources.
-   * Specifically targets Meteora DLMM pairs first, then broadens.
+   * Fetch DLMM candidates from multiple sources.
+   *
+   * Strategy 0 (primary): Meteora DLMM API — authoritative list of all
+   *   active DLMM pools. Includes PumpFun tokens that have DLMM pools.
+   *   All results are guaranteed to be real DLMM pools.
+   *
+   * Strategy 1 (secondary): DexScreener token-boosts — trending Solana
+   *   tokens. For each, findDlmmPoolForToken() will search their DLMM pool.
+   *
+   * Strategy 2 (tertiary): DexScreener search for meteora_dlmm pairs.
    */
   private async fetchMemecoins(): Promise<DexScreenerPair[]> {
     let allPairs: DexScreenerPair[] = [];
 
-    // Strategy 1: Direct search for Meteora DLMM memecoins
-    const meteoraQueries = [
-      'meteora dlmm meme',
-      'meteora dlmm SOL',
-      'meteora memecoin',
-    ];
+    // ── Strategy 0: Meteora DLMM API (primary source) ──────────────
+    const meteoraApiPairs = await this.fetchFromMeteoraDLMM();
+    allPairs.push(...meteoraApiPairs);
+    logger.info(`[PoolDiscovery] Strategy 0 (Meteora API): ${meteoraApiPairs.length} DLMM pairs`);
 
-    for (const q of meteoraQueries) {
-      try {
-        const resp = await axios.get<{ pairs: DexScreenerPair[] }>(
-          `${DEXSCREENER_API}/latest/dex/search`,
-          { params: { q }, timeout: 15_000 },
-        );
-        const pairs = (resp.data?.pairs ?? []).filter(
-          (p: DexScreenerPair) =>
-            p.chainId === 'solana' &&
-            p.dexId?.toLowerCase().includes('meteora'),
-        );
-        allPairs.push(...pairs);
-      } catch {
-        // continue
-      }
-    }
-
-    logger.info(`[PoolDiscovery] Meteora-specific search: ${allPairs.length} pairs`);
-
-    // Strategy 2: Boosted/trending tokens — then check if they have Meteora pools
+    // ── Strategy 1: DexScreener boosted/trending tokens ────────────
+    // These might be PumpSwap — findDlmmPoolForToken() will look for their DLMM pool.
     try {
-      const resp = await axios.get(`${DEXSCREENER_API}/token-boosts/top/v1`, {
-        timeout: 15_000,
-      });
-      const boosts = resp.data ?? [];
-      const solanaMints: string[] = boosts
+      const resp = await axios.get(`${DEXSCREENER_API}/token-boosts/top/v1`, { timeout: 12_000 });
+      const solanaMints: string[] = (resp.data ?? [])
         .filter((b: any) => b.chainId === 'solana')
         .map((b: any) => b.tokenAddress)
-        .slice(0, 30);
+        .slice(0, 20);
 
-      // Fetch all pairs for these tokens, we'll find Meteora ones later
       for (let i = 0; i < solanaMints.length; i += 5) {
         const batch = solanaMints.slice(i, i + 5).join(',');
         try {
           const pairResp = await axios.get(
             `${DEXSCREENER_API}/tokens/v1/solana/${batch}`,
-            { timeout: 15_000 },
+            { timeout: 12_000 },
           );
-          const data = Array.isArray(pairResp.data) ? pairResp.data : (pairResp.data?.pairs ?? []);
-          const solanaPairs = data.filter(
-            (p: DexScreenerPair) => p.chainId === 'solana',
-          );
-          allPairs.push(...solanaPairs);
-        } catch {
-          // skip
-        }
+          const data: DexScreenerPair[] = Array.isArray(pairResp.data)
+            ? pairResp.data
+            : (pairResp.data?.pairs ?? []);
+          // Keep only Solana pairs; dexId filtering is done in validateAndScore
+          allPairs.push(...data.filter(p => p.chainId === 'solana'));
+        } catch { /* skip batch */ }
       }
     } catch {
-      logger.debug('[PoolDiscovery] Boosted endpoint failed');
+      logger.debug('[PoolDiscovery] Strategy 1 (boosted) failed');
     }
 
-    // Strategy 3: General memecoin search
-    const memeQueries = ['solana meme new', 'SOL memecoin trending', 'pump.fun meme'];
-    for (const q of memeQueries) {
+    // ── Strategy 2: DexScreener meteora_dlmm search ─────────────────
+    for (const q of ['meteora dlmm', 'meteora dlmm SOL meme']) {
       try {
         const resp = await axios.get<{ pairs: DexScreenerPair[] }>(
           `${DEXSCREENER_API}/latest/dex/search`,
-          { params: { q }, timeout: 15_000 },
+          { params: { q }, timeout: 12_000 },
         );
         const pairs = (resp.data?.pairs ?? []).filter(
-          (p: DexScreenerPair) => p.chainId === 'solana',
+          p => p.chainId === 'solana' && p.dexId?.toLowerCase() === 'meteora_dlmm',
         );
         allPairs.push(...pairs);
-      } catch {
-        // continue
-      }
+      } catch { /* continue */ }
     }
 
-    // Deduplicate by pairAddress
+    // ── Deduplicate by pairAddress, sort by volume ──────────────────
     const seen = new Set<string>();
     allPairs = allPairs.filter(p => {
-      if (seen.has(p.pairAddress)) return false;
+      if (!p.pairAddress || seen.has(p.pairAddress)) return false;
       seen.add(p.pairAddress);
       return true;
     });
-
-    // Sort by 24h volume desc
     allPairs.sort((a, b) => (b.volume?.h24 ?? 0) - (a.volume?.h24 ?? 0));
 
     logger.info(`[PoolDiscovery] Total unique pairs: ${allPairs.length}`);
     return allPairs;
+  }
+
+  /**
+   * Query Meteora DLMM API for top pools sorted by 24h volume.
+   * All results are real DLMM pools — no DAMM/PumpSwap contamination.
+   * Converts to DexScreenerPair shape for downstream compatibility.
+   */
+  private async fetchFromMeteoraDLMM(): Promise<DexScreenerPair[]> {
+    try {
+      const resp = await axios.get(`${METEORA_DLMM_API}/pair/all_with_pagination`, {
+        params: { page: 0, limit: 100, sort_key: 'volume', order_by: 'desc' },
+        timeout: 12_000,
+      });
+
+      const raw = resp.data;
+      const pairs: any[] = Array.isArray(raw) ? raw : (raw?.data ?? raw?.pairs ?? []);
+      if (pairs.length === 0) return [];
+
+      const now = Date.now();
+      const DEFAULT_AGE_MS = 7 * 24 * 60 * 60 * 1000; // fallback: assume 7-day-old pool
+      const result: DexScreenerPair[] = [];
+
+      for (const p of pairs) {
+        const mintX: string = p.mint_x ?? p.tokenXMint ?? '';
+        const mintY: string = p.mint_y ?? p.tokenYMint ?? '';
+        const addr: string  = p.address ?? p.pubkey ?? p.pool_address ?? '';
+
+        if (!addr) continue;
+
+        // Only SOL-paired pools
+        const hasSol = mintX === SOL_MINT || mintY === SOL_MINT;
+        if (!hasSol) continue;
+
+        const baseMint = mintY === SOL_MINT ? mintX : mintY;
+        if (!baseMint) continue;
+
+        const name: string   = p.name ?? '';
+        const symbol: string = name.split('/')[0]?.trim() || baseMint.slice(0, 6);
+        const vol24h: number = p.trade_volume_24h ?? p.volume_24h ?? p.volume ?? 0;
+        const liq: number    = p.liquidity ?? p.tvl ?? 0;
+        const price: number  = p.current_price ?? p.price ?? 0;
+
+        // Parse created_at defensively (ISO string or Unix seconds/ms)
+        let createdAt = 0;
+        if (p.created_at) {
+          createdAt = typeof p.created_at === 'number'
+            ? (p.created_at < 1e12 ? p.created_at * 1000 : p.created_at)
+            : (new Date(p.created_at as string).getTime() || 0);
+        }
+        // If unknown, default to 7 days ago so age filter doesn't hard-reject
+        const pairCreatedAt = createdAt > 0 ? createdAt : now - DEFAULT_AGE_MS;
+
+        result.push({
+          chainId: 'solana',
+          dexId: 'meteora_dlmm',
+          url: '',
+          pairAddress: addr,
+          baseToken: { address: baseMint, symbol, name },
+          quoteToken: { address: SOL_MINT, symbol: 'SOL', name: 'Solana' },
+          priceUsd: String(price),
+          volume: { h24: vol24h },
+          liquidity: { usd: liq },
+          pairCreatedAt,
+          fdv: p.market_cap ?? p.fdv ?? 0,
+        });
+      }
+
+      return result;
+    } catch (error) {
+      logger.warn(`[PoolDiscovery] Meteora API fetch failed: ${error}`);
+      return [];
+    }
   }
 
   // ─── Filtering ─────────────────────────────────────────────────
