@@ -5,6 +5,7 @@
  * - Price drifts out of bin range
  * - IL exceeds threshold
  * - Scheduled rebalancing interval hit
+ * - Position timeout exceeded
  */
 
 import { Connection } from '@solana/web3.js';
@@ -54,16 +55,25 @@ export class Rebalancer {
   }
 
   /**
-   * Evaluate a single position
+   * Evaluate a single position. Caches pool analysis to avoid double RPC calls.
    */
   async evaluate(position: Position): Promise<RebalanceDecision> {
-    // Update position first
     const updated = await this.positionManager.updatePosition(position.id);
     if (!updated) {
       return { positionId: position.id, action: 'hold', reason: 'Failed to update' };
     }
 
-    // 1. Check IL limit
+    // 1. Check position timeout
+    const hoursOpen = (Date.now() - position.entryTime) / (1000 * 60 * 60);
+    if (hoursOpen > STRATEGY_CONFIG.POSITION_TIMEOUT_HOURS && updated.pnlPercent < 1) {
+      return {
+        positionId: position.id,
+        action: 'close',
+        reason: `Position timeout: ${hoursOpen.toFixed(1)}h open with only ${updated.pnlPercent.toFixed(2)}% PnL`,
+      };
+    }
+
+    // 2. Check IL limit
     if (Math.abs(updated.ilPercent) >= STRATEGY_CONFIG.MAX_IL_PERCENT) {
       return {
         positionId: position.id,
@@ -72,7 +82,7 @@ export class Rebalancer {
       };
     }
 
-    // 2. Check loss limit
+    // 3. Check loss limit
     if (updated.pnlPercent <= -STRATEGY_CONFIG.MAX_LOSS_PERCENT) {
       return {
         positionId: position.id,
@@ -81,7 +91,7 @@ export class Rebalancer {
       };
     }
 
-    // 3. Check if price drifted out of range
+    // 4. Check if price drifted out of range (fetch analysis once, reuse)
     const analysis = await this.poolReader.analyzePool(position.poolAddress);
     if (analysis) {
       const activeId = analysis.pool.activeId;
@@ -95,21 +105,18 @@ export class Rebalancer {
           newRange: { min: analysis.suggestedRange.min, max: analysis.suggestedRange.max },
         };
       }
-    }
 
-    // 4. Check scheduled rebalance
-    const lastRebalance = this.lastRebalanceTime.get(position.id) || position.entryTime;
-    const timeSince = Date.now() - lastRebalance;
-    const interval = TIME_CONSTANTS.REBALANCE_INTERVAL_MS;
+      // 5. Check scheduled rebalance (reuse the same analysis)
+      const lastRebalance = this.lastRebalanceTime.get(position.id) || position.entryTime;
+      const timeSince = Date.now() - lastRebalance;
+      const interval = TIME_CONSTANTS.REBALANCE_INTERVAL_MS;
 
-    if (timeSince >= interval) {
-      const analysis2 = await this.poolReader.analyzePool(position.poolAddress);
-      if (analysis2) {
+      if (timeSince >= interval) {
         return {
           positionId: position.id,
           action: 'rebalance',
           reason: `Scheduled rebalance (${(timeSince / TIME_CONSTANTS.MILLISECONDS_PER_HOUR).toFixed(1)}h since last)`,
-          newRange: analysis2.suggestedRange,
+          newRange: analysis.suggestedRange,
         };
       }
     }
@@ -127,23 +134,28 @@ export class Rebalancer {
     if (!position) return false;
 
     if (decision.action === 'close') {
-      const closed = await this.positionManager.closePosition(decision.positionId);
+      // Determine the right exit reason from the decision reason
+      let exitReason: Position['exitReason'] = 'manual';
+      if (decision.reason.includes('timeout')) exitReason = 'stop_loss';
+      else if (decision.reason.includes('IL')) exitReason = 'il_limit';
+      else if (decision.reason.includes('Loss')) exitReason = 'stop_loss';
+
+      const closed = await this.positionManager.closePosition(decision.positionId, exitReason);
       return closed !== null;
     }
 
     if (decision.action === 'rebalance' && decision.newRange) {
       logger.info(`Rebalancing ${position.id}: closing old, opening new range`);
 
-      // Close old position
-      const closed = await this.positionManager.closePosition(decision.positionId);
+      const closed = await this.positionManager.closePosition(decision.positionId, 'rebalance');
       if (!closed) return false;
 
-      // Open new position with updated range
       const newPosition = await this.positionManager.openPosition(
         position.poolAddress,
-        closed.currentValueUsd + closed.feesEarned, // Compound fees
+        closed.currentValueUsd + closed.feesEarned,
         decision.newRange.min,
         decision.newRange.max,
+        position.tokenSymbol,
       );
 
       if (newPosition) {

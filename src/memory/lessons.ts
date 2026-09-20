@@ -44,6 +44,9 @@ export interface ThresholdState {
   MAX_IL_PERCENT: number;
   PROFIT_TARGET_PERCENT: number;
   MAX_LOSS_PERCENT: number;
+  MIN_MCAP_USD: number;
+  MAX_MCAP_USD: number;
+  MIN_FEE_ACTIVE_TVL_RATIO: number;
 }
 
 interface LessonsStore {
@@ -74,6 +77,9 @@ function defaultThresholds(): ThresholdState {
     MAX_IL_PERCENT:        10,
     PROFIT_TARGET_PERCENT: 10,
     MAX_LOSS_PERCENT:      10,
+    MIN_MCAP_USD:          150_000,
+    MAX_MCAP_USD:          10_000_000,
+    MIN_FEE_ACTIVE_TVL_RATIO: 0.05,
   };
 }
 
@@ -280,6 +286,33 @@ export function pinLesson(lessonId: string, pin: boolean): boolean {
  */
 export function getThresholds(): ThresholdState {
   return load().thresholds;
+}
+
+/**
+ * Get effective token filters by merging static TOKEN_FILTERS with evolved thresholds.
+ * Use this in scanner code instead of importing TOKEN_FILTERS directly.
+ */
+export function getEffectiveFilters(): {
+  MIN_DAILY_VOLUME: number;
+  MIN_LIQUIDITY: number;
+  MAX_IL_PERCENT: number;
+  PROFIT_TARGET_PERCENT: number;
+  MAX_LOSS_PERCENT: number;
+  MIN_MCAP_USD: number;
+  MAX_MCAP_USD: number;
+  MIN_FEE_ACTIVE_TVL_RATIO: number;
+} {
+  const evolved = getThresholds();
+  return {
+    MIN_DAILY_VOLUME: evolved.MIN_DAILY_VOLUME,
+    MIN_LIQUIDITY: evolved.MIN_LIQUIDITY,
+    MAX_IL_PERCENT: evolved.MAX_IL_PERCENT,
+    PROFIT_TARGET_PERCENT: evolved.PROFIT_TARGET_PERCENT,
+    MAX_LOSS_PERCENT: evolved.MAX_LOSS_PERCENT,
+    MIN_MCAP_USD: evolved.MIN_MCAP_USD,
+    MAX_MCAP_USD: evolved.MAX_MCAP_USD,
+    MIN_FEE_ACTIVE_TVL_RATIO: evolved.MIN_FEE_ACTIVE_TVL_RATIO,
+  };
 }
 
 /**

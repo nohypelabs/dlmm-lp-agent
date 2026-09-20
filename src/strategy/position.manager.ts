@@ -3,9 +3,9 @@
  *
  * Manages LP positions lifecycle:
  * - Open positions (add liquidity to DLMM bins)
- * - Track positions (value, PnL, IL)
+ * - Track positions (value, PnL, IL) using proper DLMM concentrated liquidity math
  * - Close positions (remove liquidity)
- * - Paper trading simulation
+ * - Paper trading simulation with fee estimation
  */
 
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
@@ -23,7 +23,7 @@ export interface Position {
   tokenY: string;
   tokenXDecimals: number;
   tokenYDecimals: number;
-  onChainPositionKey?: string; // PublicKey of the on-chain position account (live only)
+  onChainPositionKey?: string;
   binRange: { min: number; max: number };
   entryPrice: number;
   entryTime: number;
@@ -36,23 +36,125 @@ export interface Position {
   pnlPercent: number;
   ilPercent: number;
   feesEarned: number;
+  gasCosts: number;
   status: 'open' | 'closed' | 'rebalancing';
   isPaper: boolean;
   tokenSymbol?: string;
   strategy?: string;
   exitReason?: 'take_profit' | 'stop_loss' | 'il_limit' | 'rebalance' | 'manual';
+  lastFeeUpdateTime?: number;
 }
 
 export class PositionManager {
   private connection: Connection;
   private wallet: Keypair | null;
-  private positions: Map<string, Position> = new Map();
+  public positions: Map<string, Position> = new Map();
   private isPaper: boolean;
 
   constructor(connection: Connection, wallet: Keypair | null = null) {
     this.connection = connection;
     this.wallet = wallet;
     this.isPaper = OPERATION_MODE.PAPER_TRADING || !wallet;
+  }
+
+  /**
+   * Restore positions from persisted data (called on startup).
+   */
+  restorePositions(saved: Position[]): void {
+    for (const pos of saved) {
+      if (pos.status === 'open') {
+        if (pos.gasCosts === undefined) pos.gasCosts = 0;
+        if (pos.lastFeeUpdateTime === undefined) pos.lastFeeUpdateTime = pos.entryTime;
+        this.positions.set(pos.id, pos);
+        logger.info(`Recovered position ${pos.id}: ${pos.tokenSymbol ?? 'unknown'} $${pos.currentValueUsd.toFixed(2)}`);
+      }
+    }
+  }
+
+  /**
+   * Calculate token amounts for a DLMM concentrated liquidity position
+   * based on current price vs the position's bin range.
+   *
+   * In DLMM, as price moves through bins, the X/Y composition changes:
+   * - Price up: position sells X for Y (less X, more Y)
+   * - Price down: position sells Y for X (more X, less Y)
+   * - Out of range high: 100% Y (all sold to Y)
+   * - Out of range low: 100% X (all sold to X)
+   */
+  private calculateBinAmounts(
+    entryAmountX: number,
+    entryAmountY: number,
+    entryPrice: number,
+    currentPrice: number,
+    binRangeMin: number,
+    binRangeMax: number,
+  ): { amountX: number; amountY: number } {
+    // Convert bin IDs to prices (approximate: each bin step is ~1%)
+    // binPrice = entryPrice * (1.01)^(binId - activeBinId)
+    // For simplicity, use the entry price as the active bin reference
+    const binStepPct = 0.01; // 1% per bin (standard DLMM)
+    const priceLow = entryPrice * Math.pow(1 + binStepPct, binRangeMin);
+    const priceHigh = entryPrice * Math.pow(1 + binStepPct, binRangeMax);
+
+    // Total liquidity value at entry (L = value / f(price))
+    // For concentrated liquidity: value = L * (2*sqrt(P) - sqrt(Pa) - P/sqrt(Pb))
+    // Simplified: track ratio of change
+
+    if (currentPrice <= priceLow) {
+      // Out of range LOW: position is 100% token X
+      // At entry, total value was split. Now all converted to X at the lower bound price.
+      const entryValue = entryAmountX * entryPrice + entryAmountY;
+      return { amountX: entryValue / priceLow, amountY: 0 };
+    }
+
+    if (currentPrice >= priceHigh) {
+      // Out of range HIGH: position is 100% token Y
+      const entryValue = entryAmountX * entryPrice + entryAmountY;
+      return { amountX: 0, amountY: entryValue };
+    }
+
+    // In range: use concentrated liquidity formula
+    // L = totalValue / (2*sqrt(P) - sqrt(Pa) - P/sqrt(Pb))
+    const entryValue = entryAmountX * entryPrice + entryAmountY;
+    const sqrtPa = Math.sqrt(priceLow);
+    const sqrtPb = Math.sqrt(priceHigh);
+    const sqrtP0 = Math.sqrt(entryPrice);
+    const L = entryValue / (2 * sqrtP0 - sqrtPa - entryPrice / sqrtPb);
+
+    // At current price P:
+    const sqrtP = Math.sqrt(currentPrice);
+    const yAmount = L * (sqrtP - sqrtPa);
+    const xAmount = L * (1 / sqrtP - 1 / sqrtPb);
+
+    return {
+      amountX: Math.max(0, xAmount),
+      amountY: Math.max(0, yAmount),
+    };
+  }
+
+  /**
+   * Calculate impermanent loss for a concentrated liquidity position.
+   * IL = (positionValue - hodlValue) / hodlValue
+   * Returns negative number (loss). We return absolute value for display.
+   */
+  private calculateDLMMIL(
+    entryAmountX: number,
+    entryAmountY: number,
+    entryPrice: number,
+    currentPrice: number,
+    binRangeMin: number,
+    binRangeMax: number,
+  ): number {
+    const { amountX, amountY } = this.calculateBinAmounts(
+      entryAmountX, entryAmountY, entryPrice, currentPrice, binRangeMin, binRangeMax,
+    );
+
+    const currentValue = amountX * currentPrice + amountY;
+    const hodlValue = entryAmountX * currentPrice + entryAmountY;
+
+    if (hodlValue === 0) return 0;
+    // IL is always negative or zero
+    return Math.abs(((hodlValue - currentValue) / hodlValue) * 100);
   }
 
   /**
@@ -66,14 +168,12 @@ export class PositionManager {
     tokenSymbol?: string,
     strategy?: LPStrategy,
   ): Promise<Position | null> {
-    // Check position limits
     const openPositions = this.getOpenPositions();
     if (openPositions.length >= STRATEGY_CONFIG.MAX_POSITIONS) {
       logger.warn(`Max positions reached (${STRATEGY_CONFIG.MAX_POSITIONS}). Cannot open new.`);
       return null;
     }
 
-    // Check position size
     const maxSize = POSITION_CONFIG.POSITION_SIZE;
     if (amountUsd > maxSize) {
       logger.warn(`Position size $${amountUsd} exceeds max $${maxSize}. Capping.`);
@@ -87,23 +187,25 @@ export class PositionManager {
         ? parseFloat(activeBin.pricePerToken)
         : 0;
 
-      const positionId = `pos_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      if (entryPrice <= 0) {
+        logger.error('Invalid entry price from active bin');
+        return null;
+      }
 
+      const positionId = `pos_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       const tokenXDecimals = dlmmPool.tokenX.mint.decimals;
       const tokenYDecimals = dlmmPool.tokenY.mint.decimals;
 
+      const effectiveSide = strategy?.side ?? 'both';
+      const effectiveMinBin = strategy
+        ? activeBin.binId - strategy.binsBelow
+        : minBinId;
+      const effectiveMaxBin = strategy
+        ? activeBin.binId + strategy.binsAbove
+        : maxBinId;
+
       if (this.isPaper) {
         // Paper trading: simulate position
-        // Apply strategy-driven bin range override when a preset is provided
-        const effectiveSide = strategy?.side ?? 'both';
-        const paperMinBin = strategy
-          ? activeBin.binId - strategy.binsBelow
-          : minBinId;
-        const paperMaxBin = strategy
-          ? activeBin.binId + strategy.binsAbove
-          : maxBinId;
-
-        // Compute simulated token amounts based on entry side
         let paperAmountX: number;
         let paperAmountY: number;
         if (effectiveSide === 'token_only') {
@@ -113,7 +215,7 @@ export class PositionManager {
           paperAmountX = 0;
           paperAmountY = amountUsd;
         } else {
-          paperAmountX = amountUsd / 2 / entryPrice; // Split 50/50
+          paperAmountX = amountUsd / 2 / entryPrice;
           paperAmountY = amountUsd / 2;
         }
 
@@ -124,7 +226,7 @@ export class PositionManager {
           tokenY: dlmmPool.tokenY.publicKey.toBase58(),
           tokenXDecimals,
           tokenYDecimals,
-          binRange: { min: paperMinBin, max: paperMaxBin },
+          binRange: { min: effectiveMinBin, max: effectiveMaxBin },
           entryPrice,
           entryTime: Date.now(),
           amountX: paperAmountX,
@@ -136,15 +238,17 @@ export class PositionManager {
           pnlPercent: 0,
           ilPercent: 0,
           feesEarned: 0,
+          gasCosts: 0,
           status: 'open',
           isPaper: true,
           tokenSymbol,
           strategy: strategy?.id ?? 'spot_balanced',
+          lastFeeUpdateTime: Date.now(),
         };
 
         this.positions.set(positionId, position);
         logger.info(`[PAPER] Opened position ${positionId}: $${amountUsd} in ${poolAddress}`);
-        logger.info(`  Strategy: ${position.strategy} | Side: ${effectiveSide} | Range: bins ${paperMinBin}-${paperMaxBin} | Entry: $${entryPrice.toFixed(6)}`);
+        logger.info(`  Strategy: ${position.strategy} | Side: ${effectiveSide} | Range: bins ${effectiveMinBin}-${effectiveMaxBin} | Entry: $${entryPrice.toFixed(6)}`);
         return position;
       }
 
@@ -154,7 +258,6 @@ export class PositionManager {
         return null;
       }
 
-      // Resolve StrategyType from preset shape
       const shapeToStrategyType = (shape: LPStrategy['shape']): StrategyType => {
         switch (shape) {
           case 'curve':   return StrategyType.Curve;
@@ -163,34 +266,20 @@ export class PositionManager {
         }
       };
       const strategyType = strategy ? shapeToStrategyType(strategy.shape) : StrategyType.Spot;
-      const entrySide = strategy?.side ?? 'both';
 
-      // Apply strategy-driven bin range override
-      const effectiveMinBin = strategy
-        ? activeBin.binId - strategy.binsBelow
-        : minBinId;
-      const effectiveMaxBin = strategy
-        ? activeBin.binId + strategy.binsAbove
-        : maxBinId;
-
-      // Calculate token amounts based on entry side
       let totalXAmount: BN;
       let totalYAmount: BN;
-      if (entrySide === 'token_only') {
-        // All capital deployed as token X; Y (SOL) stays at zero
+      if (effectiveSide === 'token_only') {
         totalXAmount = new BN(Math.floor((amountUsd / entryPrice) * 10 ** dlmmPool.tokenX.mint.decimals));
         totalYAmount = new BN(0);
-      } else if (entrySide === 'sol_only') {
-        // All capital deployed as token Y (SOL); X stays at zero
+      } else if (effectiveSide === 'sol_only') {
         totalXAmount = new BN(0);
         totalYAmount = new BN(Math.floor(amountUsd * 10 ** dlmmPool.tokenY.mint.decimals));
       } else {
-        // Default: 50/50 split
         totalXAmount = new BN(Math.floor((amountUsd / 2 / entryPrice) * 10 ** dlmmPool.tokenX.mint.decimals));
         totalYAmount = new BN(Math.floor((amountUsd / 2) * 10 ** dlmmPool.tokenY.mint.decimals));
       }
 
-      // Create position with the resolved strategy
       const newPosition = new Keypair();
       const createPositionTx = await dlmmPool.initializePositionAndAddLiquidityByStrategy({
         positionPubKey: newPosition.publicKey,
@@ -204,15 +293,14 @@ export class PositionManager {
         },
       });
 
-      // Sign and send transaction
+      // Sign and send with retry
+      let totalGas = 0;
       for (const tx of Array.isArray(createPositionTx) ? createPositionTx : [createPositionTx]) {
-        tx.sign(this.wallet, newPosition);
-        const sig = await this.connection.sendRawTransaction(tx.serialize());
-        await this.connection.confirmTransaction(sig, 'confirmed');
-        logger.info(`[LIVE] TX confirmed: ${sig}`);
+        const sig = await this.sendWithRetry(tx, [this.wallet, newPosition]);
+        totalGas += 0.000005; // ~5000 lamports per tx estimate
+        logger.info(`[LIVE] Open TX confirmed: ${sig}`);
       }
 
-      // Derive human-readable amounts from the BN values we sent on-chain
       const liveAmountX = totalXAmount.toNumber() / 10 ** dlmmPool.tokenX.mint.decimals;
       const liveAmountY = totalYAmount.toNumber() / 10 ** dlmmPool.tokenY.mint.decimals;
 
@@ -236,14 +324,16 @@ export class PositionManager {
         pnlPercent: 0,
         ilPercent: 0,
         feesEarned: 0,
+        gasCosts: totalGas,
         status: 'open',
         isPaper: false,
         tokenSymbol,
         strategy: strategy?.id ?? 'spot_balanced',
+        lastFeeUpdateTime: Date.now(),
       };
 
       this.positions.set(positionId, position);
-      logger.info(`[LIVE] Opened position ${positionId}: $${amountUsd} | Strategy: ${position.strategy} | Side: ${entrySide}`);
+      logger.info(`[LIVE] Opened position ${positionId}: $${amountUsd} | Strategy: ${position.strategy} | Side: ${effectiveSide}`);
       return position;
     } catch (error) {
       logger.error(`Failed to open position: ${error}`);
@@ -252,7 +342,7 @@ export class PositionManager {
   }
 
   /**
-   * Update position with current prices
+   * Update position with current prices and proper DLMM value calculation.
    */
   async updatePosition(positionId: string): Promise<Position | null> {
     const position = this.positions.get(positionId);
@@ -267,23 +357,9 @@ export class PositionManager {
 
       position.currentPrice = currentPrice;
 
-      // Calculate current value
-      const xValue = position.amountX * currentPrice;
-      const yValue = position.amountY;
-      position.currentValueUsd = xValue + yValue;
-
-      // Calculate PnL
-      position.pnl = position.currentValueUsd - position.totalValueUsd;
-      position.pnlPercent = (position.pnl / position.totalValueUsd) * 100;
-
-      // Calculate IL using standard DLMM formula: IL = 2√k/(1+k) - 1, where k = priceRatio
-      const priceRatio = currentPrice / position.entryPrice;
-      const sqrtK = Math.sqrt(priceRatio);
-      const ilFactor = (2 * sqrtK) / (1 + priceRatio) - 1;
-      position.ilPercent = Math.abs(ilFactor * 100);
-
-      // Real on-chain fee tracking (live only)
+      // ── Calculate current value using DLMM bin math ──
       if (!position.isPaper && position.onChainPositionKey && this.wallet) {
+        // Live: fetch real on-chain position data
         try {
           const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(this.wallet.publicKey);
           const onChainPos = userPositions.find(
@@ -296,16 +372,51 @@ export class PositionManager {
             const feeYUsd = parseInt(feeY.toString()) / 10 ** position.tokenYDecimals;
             position.feesEarned = feeXUsd + feeYUsd;
 
-            // Update actual on-chain amounts
             const totalX = onChainPos.positionData.totalXAmount;
             const totalY = onChainPos.positionData.totalYAmount;
             position.amountX = parseFloat(totalX) / 10 ** position.tokenXDecimals;
             position.amountY = parseFloat(totalY) / 10 ** position.tokenYDecimals;
+
+            position.currentValueUsd = position.amountX * currentPrice + position.amountY;
           }
         } catch {
-          // Non-fatal: fall through with last known values
+          // Non-fatal: use bin-based estimation
+          const { amountX, amountY } = this.calculateBinAmounts(
+            position.amountX, position.amountY, position.entryPrice, currentPrice,
+            position.binRange.min, position.binRange.max,
+          );
+          position.currentValueUsd = amountX * currentPrice + amountY;
+        }
+      } else {
+        // Paper: simulate bin-based value changes
+        const { amountX, amountY } = this.calculateBinAmounts(
+          position.amountX, position.amountY, position.entryPrice, currentPrice,
+          position.binRange.min, position.binRange.max,
+        );
+        position.currentValueUsd = amountX * currentPrice + amountY;
+
+        // ── Simulate fee accrual for paper positions ──
+        const now = Date.now();
+        const hoursSinceUpdate = (now - (position.lastFeeUpdateTime ?? position.entryTime)) / (1000 * 60 * 60);
+        if (hoursSinceUpdate > 0.01) { // at least ~36 seconds
+          // Estimate: assume position earns ~0.01-0.05% of its value per hour from fees
+          // This is conservative for active DLMM pools with $50k-500k daily volume
+          const hourlyFeeRate = 0.0002; // 0.02% per hour (~0.5% per day)
+          const estimatedFee = position.currentValueUsd * hourlyFeeRate * hoursSinceUpdate;
+          position.feesEarned += estimatedFee;
+          position.lastFeeUpdateTime = now;
         }
       }
+
+      // ── Calculate IL using DLMM concentrated liquidity formula ──
+      position.ilPercent = this.calculateDLMMIL(
+        position.amountX, position.amountY, position.entryPrice, currentPrice,
+        position.binRange.min, position.binRange.max,
+      );
+
+      // ── Calculate PnL (includes fees, excludes gas) ──
+      position.pnl = position.currentValueUsd + position.feesEarned - position.totalValueUsd - position.gasCosts;
+      position.pnlPercent = (position.pnl / position.totalValueUsd) * 100;
 
       return position;
     } catch (error) {
@@ -324,17 +435,15 @@ export class PositionManager {
       return null;
     }
 
-    // Snapshot latest values before closing
     await this.updatePosition(positionId);
     position.exitReason = reason;
 
     if (this.isPaper) {
       position.status = 'closed';
-      logger.info(`[PAPER] Closed position ${positionId} (${reason}): PnL $${position.pnl.toFixed(4)} (${position.pnlPercent.toFixed(2)}%)`);
+      logger.info(`[PAPER] Closed position ${positionId} (${reason}): PnL $${position.pnl.toFixed(4)} (${position.pnlPercent.toFixed(2)}%) Fees: $${position.feesEarned.toFixed(4)}`);
       return position;
     }
 
-    // Live: remove 100% liquidity and claim fees in one shot
     if (!this.wallet) {
       logger.error('No wallet configured for live trading');
       return null;
@@ -363,19 +472,24 @@ export class PositionManager {
         position: onChainPos.publicKey,
         fromBinId: onChainPos.positionData.lowerBinId,
         toBinId: onChainPos.positionData.upperBinId,
-        bps: new BN(10000), // 100%
-        shouldClaimAndClose: true, // harvest fees + close position account
+        bps: new BN(10000),
+        shouldClaimAndClose: true,
       });
 
+      let gasCost = 0;
       for (const tx of removeTxs) {
-        tx.sign(this.wallet);
-        const sig = await this.connection.sendRawTransaction(tx.serialize());
-        await this.connection.confirmTransaction(sig, 'confirmed');
+        const sig = await this.sendWithRetry(tx, [this.wallet]);
+        gasCost += 0.000005;
         logger.info(`[LIVE] Remove liquidity TX confirmed: ${sig}`);
       }
+      position.gasCosts += gasCost;
 
       position.status = 'closed';
-      logger.info(`[LIVE] Closed position ${positionId} (${reason}): PnL $${position.pnl.toFixed(4)} (${position.pnlPercent.toFixed(2)}%) | Fees earned: $${position.feesEarned.toFixed(4)}`);
+      // Recalculate final PnL with gas
+      position.pnl = position.currentValueUsd + position.feesEarned - position.totalValueUsd - position.gasCosts;
+      position.pnlPercent = (position.pnl / position.totalValueUsd) * 100;
+
+      logger.info(`[LIVE] Closed position ${positionId} (${reason}): PnL $${position.pnl.toFixed(4)} (${position.pnlPercent.toFixed(2)}%) | Fees: $${position.feesEarned.toFixed(4)} | Gas: $${position.gasCosts.toFixed(6)}`);
       return position;
     } catch (error) {
       logger.error(`Failed to close position ${positionId}: ${error}`);
@@ -426,7 +540,6 @@ export class PositionManager {
     const alerts: { positionId: string; reason: string }[] = [];
 
     for (const position of this.getOpenPositions()) {
-      // IL check
       if (Math.abs(position.ilPercent) >= STRATEGY_CONFIG.MAX_IL_PERCENT) {
         alerts.push({
           positionId: position.id,
@@ -434,7 +547,6 @@ export class PositionManager {
         });
       }
 
-      // Loss check
       if (position.pnlPercent <= -STRATEGY_CONFIG.MAX_LOSS_PERCENT) {
         alerts.push({
           positionId: position.id,
@@ -447,13 +559,38 @@ export class PositionManager {
   }
 
   /**
+   * Send a transaction with retry and exponential backoff.
+   */
+  private async sendWithRetry(
+    tx: any,
+    signers: Keypair[],
+    maxRetries = 3,
+  ): Promise<string> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        for (const signer of signers) {
+          tx.sign(signer);
+        }
+        const sig = await this.connection.sendRawTransaction(tx.serialize(), {
+          skipPreflight: false,
+          maxRetries: 2,
+        });
+        await this.connection.confirmTransaction(sig, 'confirmed');
+        return sig;
+      } catch (error: any) {
+        const isLastAttempt = attempt === maxRetries - 1;
+        if (isLastAttempt) throw error;
+
+        const delay = 1000 * Math.pow(2, attempt); // 1s, 2s, 4s
+        logger.warn(`TX attempt ${attempt + 1} failed: ${error.message}. Retrying in ${delay}ms...`);
+        await new Promise(r => setTimeout(r, delay));
+      }
+    }
+    throw new Error('sendWithRetry: all attempts failed');
+  }
+
+  /**
    * Claim swap fees for an open position.
-   *
-   * Paper mode: reads feesEarned, resets it, and returns the simulated amounts.
-   * Live mode: calls claimSwapFee on-chain, signs every returned transaction,
-   *            derives USD values from on-chain feeX/feeY, then resets feesEarned.
-   *
-   * Returns null on any non-fatal error.
    */
   async claimFees(
     positionId: string,
@@ -466,21 +603,18 @@ export class PositionManager {
 
     try {
       if (this.isPaper) {
-        // Paper: treat the accumulated feesEarned as the claimed amount.
-        // Assume roughly equal split between X and Y for simulation purposes.
         const totalUsd = position.feesEarned;
         const feeXUsd = totalUsd / 2;
         const feeYUsd = totalUsd / 2;
         position.feesEarned = 0;
         logger.info(
-          `[PAPER] Claimed fees for ${positionId}: $${totalUsd.toFixed(4)} (X: $${feeXUsd.toFixed(4)}, Y: $${feeYUsd.toFixed(4)})`,
+          `[PAPER] Claimed fees for ${positionId}: $${totalUsd.toFixed(4)}`,
         );
         return { feeXUsd, feeYUsd, totalUsd };
       }
 
-      // Live mode
       if (!this.wallet) {
-        logger.error('claimFees: no wallet configured for live trading');
+        logger.error('claimFees: no wallet configured');
         return null;
       }
       if (!position.onChainPositionKey) {
@@ -489,22 +623,16 @@ export class PositionManager {
       }
 
       const dlmmPool = await DLMM.create(this.connection, new PublicKey(position.poolAddress));
-
-      const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(
-        this.wallet.publicKey,
-      );
+      const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(this.wallet.publicKey);
       const onChainPos = userPositions.find(
         p => p.publicKey.toBase58() === position.onChainPositionKey,
       );
 
       if (!onChainPos) {
-        logger.warn(
-          `claimFees: on-chain position ${position.onChainPositionKey} not found — may already be closed`,
-        );
+        logger.warn(`claimFees: on-chain position not found`);
         return null;
       }
 
-      // Snapshot fee amounts before claiming (they will be zeroed after the tx)
       const { feeX, feeY } = onChainPos.positionData;
       const currentPrice = position.currentPrice || 1;
       const feeXUsd =
@@ -512,23 +640,18 @@ export class PositionManager {
       const feeYUsd = parseInt(feeY.toString()) / 10 ** position.tokenYDecimals;
       const totalUsd = feeXUsd + feeYUsd;
 
-      // Execute claim
       const claimTxs = await dlmmPool.claimSwapFee({
         owner: this.wallet.publicKey,
         position: onChainPos,
       });
 
       for (const tx of Array.isArray(claimTxs) ? claimTxs : [claimTxs]) {
-        tx.sign(this.wallet);
-        const sig = await this.connection.sendRawTransaction(tx.serialize());
-        await this.connection.confirmTransaction(sig, 'confirmed');
-        logger.info(`[LIVE] Claim fee TX confirmed: ${sig}`);
+        await this.sendWithRetry(tx, [this.wallet]);
+        position.gasCosts += 0.000005;
       }
 
       position.feesEarned = 0;
-      logger.info(
-        `[LIVE] Claimed fees for ${positionId}: $${totalUsd.toFixed(4)} (X: $${feeXUsd.toFixed(4)}, Y: $${feeYUsd.toFixed(4)})`,
-      );
+      logger.info(`[LIVE] Claimed fees for ${positionId}: $${totalUsd.toFixed(4)}`);
       return { feeXUsd, feeYUsd, totalUsd };
     } catch (error) {
       logger.error(`claimFees failed for ${positionId}: ${error}`);
@@ -537,15 +660,7 @@ export class PositionManager {
   }
 
   /**
-   * Compound fees back into the position (claim then re-add liquidity).
-   *
-   * Paper mode: adds the claimed USD value directly to totalValueUsd and
-   *             currentValueUsd so PnL tracking reflects compounded growth.
-   * Live mode: computes 50/50 token split from claimed USD and calls
-   *            addLiquidityByStrategy with a Spot strategy over the same
-   *            bin range the position was opened with.
-   *
-   * Returns true on success, false when fees are dust (<$0.01) or on error.
+   * Compound fees back into the position.
    */
   async compoundFees(positionId: string): Promise<boolean> {
     const position = this.positions.get(positionId);
@@ -554,46 +669,30 @@ export class PositionManager {
       return false;
     }
 
-    // 1. Claim first
     const claimed = await this.claimFees(positionId);
-    if (!claimed) {
-      logger.warn(`compoundFees: claimFees returned null for ${positionId}`);
-      return false;
-    }
+    if (!claimed) return false;
 
     const { feeXUsd, feeYUsd, totalUsd } = claimed;
 
-    // Dust guard
     if (totalUsd < 0.01) {
-      logger.info(`compoundFees: fees $${totalUsd.toFixed(6)} are dust — skipping ${positionId}`);
+      logger.info(`compoundFees: fees $${totalUsd.toFixed(6)} are dust — skipping`);
       return false;
     }
 
     try {
       if (this.isPaper) {
-        // Paper: re-add the fee value to the position's tracked size
         position.totalValueUsd += totalUsd;
         position.currentValueUsd += totalUsd;
-        logger.info(
-          `[PAPER] Compounded $${totalUsd.toFixed(4)} into ${positionId} — new value: $${position.currentValueUsd.toFixed(4)}`,
-        );
+        logger.info(`[PAPER] Compounded $${totalUsd.toFixed(4)} into ${positionId}`);
         return true;
       }
 
-      // Live mode
-      if (!this.wallet) {
-        logger.error('compoundFees: no wallet configured for live trading');
-        return false;
-      }
-      if (!position.onChainPositionKey) {
-        logger.error(`compoundFees: position ${positionId} has no on-chain key`);
-        return false;
-      }
+      if (!this.wallet) return false;
+      if (!position.onChainPositionKey) return false;
 
       const dlmmPool = await DLMM.create(this.connection, new PublicKey(position.poolAddress));
       const currentPrice = position.currentPrice || 1;
 
-      // Split claimed USD 50/50 into token amounts
       const totalXAmount = new BN(
         Math.floor((feeXUsd / currentPrice) * 10 ** position.tokenXDecimals),
       );
@@ -601,34 +700,25 @@ export class PositionManager {
         Math.floor(feeYUsd * 10 ** position.tokenYDecimals),
       );
 
-      const { minBinId, maxBinId } = {
-        minBinId: position.binRange.min,
-        maxBinId: position.binRange.max,
-      };
-
       const addLiqTx = await dlmmPool.addLiquidityByStrategy({
         positionPubKey: new PublicKey(position.onChainPositionKey),
         totalXAmount,
         totalYAmount,
         strategy: {
-          maxBinId,
-          minBinId,
+          maxBinId: position.binRange.max,
+          minBinId: position.binRange.min,
           strategyType: StrategyType.Spot,
         },
         user: this.wallet.publicKey,
-        slippage: 0.5,
+        slippage: STRATEGY_CONFIG.SLIPPAGE_BPS / 10000,
       });
 
       for (const tx of Array.isArray(addLiqTx) ? addLiqTx : [addLiqTx]) {
-        tx.sign(this.wallet);
-        const sig = await this.connection.sendRawTransaction(tx.serialize());
-        await this.connection.confirmTransaction(sig, 'confirmed');
-        logger.info(`[LIVE] Add liquidity (compound) TX confirmed: ${sig}`);
+        await this.sendWithRetry(tx, [this.wallet]);
+        position.gasCosts += 0.000005;
       }
 
-      logger.info(
-        `[LIVE] Compounded $${totalUsd.toFixed(4)} into ${positionId}`,
-      );
+      logger.info(`[LIVE] Compounded $${totalUsd.toFixed(4)} into ${positionId}`);
       return true;
     } catch (error) {
       logger.error(`compoundFees failed for ${positionId}: ${error}`);

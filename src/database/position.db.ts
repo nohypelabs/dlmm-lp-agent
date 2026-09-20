@@ -20,10 +20,10 @@ export interface DailySnapshot {
   totalPnl: number;
   totalPnlPercent: number;
   totalFeesEarned: number;
-  openPositions: number;
-  closedPositions: number;
-  bestPosition: { id: string; pnlPercent: number } | null;
-  worstPosition: { id: string; pnlPercent: number } | null;
+  positionsOpen: number;
+  positionsClosed: number;
+  bestPosition: { id: string; tokenSymbol: string; pnlPercent: number } | null;
+  worstPosition: { id: string; tokenSymbol: string; pnlPercent: number } | null;
 }
 
 export interface PerformanceHistory {
@@ -133,8 +133,8 @@ export function savePerformance(snapshot: DailySnapshot): void {
     // Recalculate lifetime aggregates from snapshots
     history.lifetimePnl = history.dailySnapshots.reduce((sum, s) => sum + s.totalPnl, 0);
     history.lifetimeFeesEarned = history.dailySnapshots.reduce((sum, s) => sum + s.totalFeesEarned, 0);
-    history.totalPositionsOpened = history.dailySnapshots.reduce((sum, s) => sum + s.openPositions, 0);
-    history.totalPositionsClosed = history.dailySnapshots.reduce((sum, s) => sum + s.closedPositions, 0);
+    history.totalPositionsOpened = history.dailySnapshots.reduce((sum, s) => sum + s.positionsOpen, 0);
+    history.totalPositionsClosed = history.dailySnapshots.reduce((sum, s) => sum + s.positionsClosed, 0);
 
     writeJsonFile(PERFORMANCE_FILE, history);
     logger.debug(`Saved performance snapshot for ${snapshot.date}`);
@@ -162,11 +162,12 @@ export function buildDailySnapshot(positions: Position[], date?: string): DailyS
   let worstPosition: DailySnapshot['worstPosition'] = null;
 
   for (const p of positions) {
+    const symbol = p.tokenSymbol ?? p.tokenX.slice(0, 8);
     if (!bestPosition || p.pnlPercent > bestPosition.pnlPercent) {
-      bestPosition = { id: p.id, pnlPercent: p.pnlPercent };
+      bestPosition = { id: p.id, tokenSymbol: symbol, pnlPercent: p.pnlPercent };
     }
     if (!worstPosition || p.pnlPercent < worstPosition.pnlPercent) {
-      worstPosition = { id: p.id, pnlPercent: p.pnlPercent };
+      worstPosition = { id: p.id, tokenSymbol: symbol, pnlPercent: p.pnlPercent };
     }
   }
 
@@ -176,8 +177,8 @@ export function buildDailySnapshot(positions: Position[], date?: string): DailyS
     totalPnl,
     totalPnlPercent,
     totalFeesEarned,
-    openPositions: openPositions.length,
-    closedPositions: closedPositions.length,
+    positionsOpen: openPositions.length,
+    positionsClosed: closedPositions.length,
     bestPosition,
     worstPosition,
   };

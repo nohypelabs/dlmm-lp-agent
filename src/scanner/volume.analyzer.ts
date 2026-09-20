@@ -7,6 +7,7 @@ import axios from 'axios';
 import { Connection, PublicKey } from '@solana/web3.js';
 import { logger } from '../utils/logger';
 import { TOKEN_FILTERS } from '../config/constants';
+import { getEffectiveFilters } from '../memory/lessons';
 
 export interface VolumeMetrics {
   volume24h: number;
@@ -160,24 +161,25 @@ export class VolumeAnalyzer {
    */
   private checkTier2Criteria(metrics: VolumeMetrics): boolean {
     const checks: { [key: string]: boolean } = {};
+    const evolved = getEffectiveFilters();
 
-    // Check 1: Volume in acceptable range
+    // Check 1: Volume in acceptable range (uses evolved thresholds)
     checks.volumeRange =
-      metrics.volume24h >= TOKEN_FILTERS.MIN_DAILY_VOLUME &&
+      metrics.volume24h >= evolved.MIN_DAILY_VOLUME &&
       metrics.volume24h <= TOKEN_FILTERS.MAX_DAILY_VOLUME;
 
     if (!checks.volumeRange) {
       metrics.warnings.push(
-        `Volume ${metrics.volume24h.toFixed(0)} outside ${TOKEN_FILTERS.MIN_DAILY_VOLUME}-${TOKEN_FILTERS.MAX_DAILY_VOLUME} range`
+        `Volume ${metrics.volume24h.toFixed(0)} outside ${evolved.MIN_DAILY_VOLUME}-${TOKEN_FILTERS.MAX_DAILY_VOLUME} range`
       );
     }
 
-    // Check 2: Sufficient liquidity
-    checks.minLiquidity = metrics.liquidity >= TOKEN_FILTERS.MIN_LIQUIDITY;
+    // Check 2: Sufficient liquidity (uses evolved thresholds)
+    checks.minLiquidity = metrics.liquidity >= evolved.MIN_LIQUIDITY;
 
     if (!checks.minLiquidity) {
       metrics.warnings.push(
-        `Liquidity $${metrics.liquidity.toFixed(0)} below minimum $${TOKEN_FILTERS.MIN_LIQUIDITY}`
+        `Liquidity $${metrics.liquidity.toFixed(0)} below minimum $${evolved.MIN_LIQUIDITY}`
       );
     }
 
@@ -231,19 +233,20 @@ export class VolumeAnalyzer {
    */
   private calculateScore(metrics: VolumeMetrics): number {
     let score = 0;
+    const evolved = getEffectiveFilters();
 
-    // Volume score (0-30 points)
-    if (metrics.volume24h >= TOKEN_FILTERS.MIN_DAILY_VOLUME) {
+    // Volume score (0-30 points) — uses evolved thresholds
+    if (metrics.volume24h >= evolved.MIN_DAILY_VOLUME) {
       const volumeRatio = Math.min(
-        metrics.volume24h / TOKEN_FILTERS.MIN_DAILY_VOLUME,
-        TOKEN_FILTERS.MAX_DAILY_VOLUME / TOKEN_FILTERS.MIN_DAILY_VOLUME
+        metrics.volume24h / evolved.MIN_DAILY_VOLUME,
+        TOKEN_FILTERS.MAX_DAILY_VOLUME / evolved.MIN_DAILY_VOLUME
       );
       score += Math.min(30, volumeRatio * 10);
     }
 
-    // Liquidity score (0-25 points)
-    if (metrics.liquidity >= TOKEN_FILTERS.MIN_LIQUIDITY) {
-      const liquidityRatio = metrics.liquidity / TOKEN_FILTERS.MIN_LIQUIDITY;
+    // Liquidity score (0-25 points) — uses evolved thresholds
+    if (metrics.liquidity >= evolved.MIN_LIQUIDITY) {
+      const liquidityRatio = metrics.liquidity / evolved.MIN_LIQUIDITY;
       score += Math.min(25, liquidityRatio * 5);
     }
 

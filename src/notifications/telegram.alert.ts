@@ -237,7 +237,7 @@ export async function notifyDailySummary(stats: DailySnapshot): Promise<boolean>
     `💰 <b>Portfolio Value:</b> $${stats.totalValueUsd.toFixed(2)}`,
     `🎁 <b>Fees Earned:</b> $${stats.totalFeesEarned.toFixed(4)}`,
     '',
-    `📂 <b>Open:</b> ${stats.openPositions}  |  <b>Closed:</b> ${stats.closedPositions}`,
+    `📂 <b>Open:</b> ${stats.positionsOpen}  |  <b>Closed:</b> ${stats.positionsClosed}`,
     `🏆 <b>Best:</b> ${best}`,
     `💀 <b>Worst:</b> ${worst}`,
   ].join('\n');

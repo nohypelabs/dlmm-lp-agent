@@ -28,7 +28,7 @@ export const WALLET_CONFIG = {
 
 // Strategy Parameters
 export const STRATEGY_CONFIG = {
-  STARTING_CAPITAL: parseFloat(process.env.STARTING_CAPITAL || '150'),
+  STARTING_CAPITAL: parseFloat(process.env.STARTING_CAPITAL || '60'),
   MAX_POSITIONS: parseInt(process.env.MAX_POSITIONS || '1'),
   TARGET_DAILY_GAIN: parseFloat(process.env.TARGET_DAILY_GAIN || '20'),
   MAX_LOSS_PERCENT: parseFloat(process.env.MAX_LOSS_PERCENT || '10'),
@@ -36,6 +36,8 @@ export const STRATEGY_CONFIG = {
   REBALANCE_FREQUENCY: parseInt(process.env.REBALANCE_FREQUENCY || '6'),
   MAX_REENTRY_PER_TOKEN: parseInt(process.env.MAX_REENTRY_PER_TOKEN || '3'),
   PROFIT_TARGET_PERCENT: parseFloat(process.env.PROFIT_TARGET_PERCENT || '10'),
+  POSITION_TIMEOUT_HOURS: parseFloat(process.env.POSITION_TIMEOUT_HOURS || '48'),
+  SLIPPAGE_BPS: parseInt(process.env.SLIPPAGE_BPS || '300'), // 3% default slippage
 };
 
 // Calculate position sizing
@@ -56,6 +58,18 @@ export const TOKEN_FILTERS = {
   MIN_UNIQUE_TRADERS: 100,
   MIN_BUY_SELL_RATIO: 0.7,
   MAX_BUY_SELL_RATIO: 1.3,
+
+  // Meridian-inspired filters
+  MIN_FEE_ACTIVE_TVL_RATIO: parseFloat(process.env.MIN_FEE_ACTIVE_TVL_RATIO || '0.05'), // min fee/active-TVL ratio
+  MIN_MCAP_USD: parseFloat(process.env.MIN_MCAP_USD || '150000'), // min $150k market cap
+  MAX_MCAP_USD: parseFloat(process.env.MAX_MCAP_USD || '10000000'), // max $10M market cap
+  MAX_TOP10_HOLDER_PCT: parseInt(process.env.MAX_TOP10_HOLDER_PCT || '60'), // max 60% in top-10 holders
+  MAX_BUNDLERS_PCT: parseInt(process.env.MAX_BUNDLERS_PCT || '30'), // max 30% bundlers in top-100 holders
+
+  // Meridian additional filters
+  MAX_ATH_DISTANCE_PCT: parseFloat(process.env.MAX_ATH_DISTANCE_PCT || '50'), // Reject if within 50% of ATH (potential pump-n-dump)
+  MIN_TOKEN_FEES_SOL: parseFloat(process.env.MIN_TOKEN_FEES_SOL || '1'), // Min 1 SOL in daily fees (active pool)
+  BLOCKED_LAUNCHPADS: (process.env.BLOCKED_LAUNCHPADS || '').split(',').filter(x => x), // Comma-separated blocked launchpad addresses
 };
 
 // DLMM Configuration
@@ -65,11 +79,15 @@ export const DLMM_CONFIG = {
   DEFAULT_BIN_RANGE_PERCENT: 8, // ±8% default range
   MIN_BIN_RANGE_PERCENT: 5,
   MAX_BIN_RANGE_PERCENT: 15,
+
+  // Meridian-inspired: bin step filtering (narrow bins = better fees, wide bins = more range)
+  MIN_BIN_STEP: parseInt(process.env.MIN_BIN_STEP || '80'), // minimum bin step (narrower bins)
+  MAX_BIN_STEP: parseInt(process.env.MAX_BIN_STEP || '125'), // maximum bin step (wider bins)
 };
 
 // Operation Mode
 export const OPERATION_MODE = {
-  MODE: process.env.MODE || 'manual_approve', // 'full_auto' or 'manual_approve'
+  MODE: process.env.MODE || 'full_auto', // 'full_auto' or 'manual_approve'
   PAPER_TRADING: process.env.PAPER_TRADING === 'true',
   DRY_RUN: process.env.DRY_RUN === 'true',
 };
@@ -79,6 +97,15 @@ export const TELEGRAM_CONFIG = {
   BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN || '',
   CHAT_ID: process.env.TELEGRAM_CHAT_ID || '',
   ENABLED: !!(process.env.TELEGRAM_BOT_TOKEN && process.env.TELEGRAM_CHAT_ID),
+};
+
+// OKX OnchainOS Configuration (Meridian-inspired)
+export const OKX_CONFIG = {
+  ENABLED: process.env.OKX_ENABLED === 'true',
+  MAX_RISK_LEVEL: process.env.MAX_RISK_LEVEL || 'HIGH', // Allowed: LOW, MEDIUM, HIGH
+  MAX_BUNDLE_PCT: parseFloat(process.env.MAX_BUNDLE_PCT || '50'), // Max 50% bundler concentration
+  MAX_SNIPER_PCT: parseFloat(process.env.MAX_SNIPER_PCT || '30'), // Max 30% sniper activity
+  MAX_SUSPICIOUS_PCT: parseFloat(process.env.MAX_SUSPICIOUS_PCT || '20'), // Max 20% suspicious wallets
 };
 
 // Safety Thresholds
@@ -214,6 +241,7 @@ export default {
   DLMM_CONFIG,
   OPERATION_MODE,
   TELEGRAM_CONFIG,
+  OKX_CONFIG,
   SAFETY_THRESHOLDS,
   LOG_CONFIG,
   METRICS_CONFIG,

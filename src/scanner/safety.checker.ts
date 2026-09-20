@@ -6,8 +6,9 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { getMint } from '@solana/spl-token';
 import { logger } from '../utils/logger';
-import { TOKEN_FILTERS } from '../config/constants';
+import { TOKEN_FILTERS, OKX_CONFIG } from '../config/constants';
 import { isTokenBlocked } from '../memory/blacklist';
+import OKXIntegration, { OKXTokenRisk } from './okx.integration';
 
 export interface SafetyCheckResult {
   passed: boolean;
@@ -26,9 +27,11 @@ export interface SafetyCheckResult {
 
 export class SafetyChecker {
   private connection: Connection;
+  private okxIntegration: OKXIntegration;
 
   constructor(connection: Connection) {
     this.connection = connection;
+    this.okxIntegration = new OKXIntegration(OKX_CONFIG.ENABLED);
   }
 
   /**
@@ -73,6 +76,11 @@ export class SafetyChecker {
 
       // TIER 2: DISTRIBUTION CHECKS (Warnings + scoring)
       await this.runTier2Checks(mintPubkey, result);
+
+      // TIER 3: OKX RISK CHECKS (Meridian-inspired - if enabled)
+      if (OKX_CONFIG.ENABLED) {
+        await this.runTier3Checks(mintAddress, result);
+      }
 
       // Calculate score based on all checks
       result.score = this.calculateScore(result);
@@ -232,19 +240,51 @@ export class SafetyChecker {
         .slice(0, 10)
         .reduce((sum, acc) => sum + Number(acc.amount), 0);
       const top10Pct = (top10Total / totalSupply) * 100;
-      const concentrationOk = top10Pct <= 50;
+      const maxTop10Pct = TOKEN_FILTERS.MAX_TOP10_HOLDER_PCT || 60;
+      const concentrationOk = top10Pct <= maxTop10Pct;
 
       result.checks['holder_concentration'] = {
         passed: concentrationOk,
         message: concentrationOk
-          ? `Top 10 holders: ${top10Pct.toFixed(1)}% (acceptable)`
-          : `Top 10 holders: ${top10Pct.toFixed(1)}% — high concentration risk`,
+          ? `Top 10 holders: ${top10Pct.toFixed(1)}% (≤${maxTop10Pct}% limit)`
+          : `Top 10 holders: ${top10Pct.toFixed(1)}% exceeds ${maxTop10Pct}% — high concentration risk`,
         critical: false,
       };
       if (!concentrationOk) {
         result.warnings.push(
           `Top 10 holders control ${top10Pct.toFixed(1)}% of supply`,
         );
+      }
+
+      // Check 3: Bundler concentration (Meridian-inspired)
+      // Bundlers are wallets that appear as top holders across many tokens (exchange wallets, OTC desks)
+      // For now, we use a heuristic: if top-100 holders control > MAX_BUNDLERS_PCT, flag as potential bundler risk
+      const maxBundlersPct = TOKEN_FILTERS.MAX_BUNDLERS_PCT || 30;
+      if (holders.length >= 100) {
+        const top100Total = holders
+          .slice(0, 100)
+          .reduce((sum, acc) => sum + Number(acc.amount), 0);
+        const top100Pct = (top100Total / totalSupply) * 100;
+        const bundlersOk = top100Pct <= maxBundlersPct;
+
+        result.checks['bundler_concentration'] = {
+          passed: bundlersOk,
+          message: bundlersOk
+            ? `Top 100 holders: ${top100Pct.toFixed(1)}% (≤${maxBundlersPct}% limit)`
+            : `Top 100 holders: ${top100Pct.toFixed(1)}% exceeds ${maxBundlersPct}% — possible bundler/exchange concentration`,
+          critical: false,
+        };
+        if (!bundlersOk) {
+          result.warnings.push(
+            `Top 100 holders concentration high (${top100Pct.toFixed(1)}%) — possible exchange/bundler presence`,
+          );
+        }
+      } else {
+        result.checks['bundler_concentration'] = {
+          passed: true,
+          message: `Insufficient holder data (${holders.length} holders) for bundler check`,
+          critical: false,
+        };
       }
 
       logger.debug(
@@ -254,6 +294,110 @@ export class SafetyChecker {
       // Non-fatal: network issue should not block the whole check
       logger.debug(`Tier 2 checks failed (non-fatal): ${error}`);
       result.warnings.push('Holder distribution check unavailable (network)');
+    }
+  }
+
+  /**
+   * TIER 3: OKX Risk Checks (Meridian-inspired)
+   * Uses OKX OnchainOS API for advanced risk assessment.
+   */
+  private async runTier3Checks(
+    mintAddress: string,
+    result: SafetyCheckResult,
+  ): Promise<void> {
+    try {
+      const okxResult = await this.okxIntegration.getTokenRisk(mintAddress);
+
+      if (!okxResult.success || !okxResult.risk) {
+        result.warnings.push('OKX risk data unavailable');
+        return;
+      }
+
+      const risk = okxResult.risk;
+
+      // Check 1: Risk level (critical if HIGH)
+      const riskLevelOk = risk.risk_level !== 'HIGH' || OKX_CONFIG.MAX_RISK_LEVEL === 'HIGH';
+      result.checks['okx_risk_level'] = {
+        passed: riskLevelOk,
+        message: `OKX Risk Level: ${risk.risk_level}`,
+        critical: risk.risk_level === 'HIGH' && OKX_CONFIG.MAX_RISK_LEVEL !== 'HIGH',
+      };
+      if (!riskLevelOk) {
+        result.errors.push(`OKX Risk Level is HIGH - token flagged as dangerous`);
+      }
+
+      // Check 2: Bundler concentration (warning only unless extreme)
+      const bundlerOk = risk.bundle_pct <= OKX_CONFIG.MAX_BUNDLE_PCT;
+      result.checks['okx_bundle_pct'] = {
+        passed: bundlerOk,
+        message: bundlerOk
+          ? `Bundler concentration: ${risk.bundle_pct.toFixed(1)}% (≤${OKX_CONFIG.MAX_BUNDLE_PCT}%)`
+          : `Bundler concentration: ${risk.bundle_pct.toFixed(1)}% exceeds ${OKX_CONFIG.MAX_BUNDLE_PCT}%`,
+        critical: risk.bundle_pct > 80, // Only critical if >80% (clear wash trading)
+      };
+      if (risk.bundle_pct > 80) {
+        result.errors.push(`Extreme bundler concentration (${risk.bundle_pct.toFixed(1)}%) - likely wash trading`);
+      } else if (!bundlerOk) {
+        result.warnings.push(`High bundler concentration (${risk.bundle_pct.toFixed(1)}%)`);
+      }
+
+      // Check 3: Sniper concentration (warning only)
+      const sniperOk = risk.sniper_pct <= OKX_CONFIG.MAX_SNIPER_PCT;
+      result.checks['okx_sniper_pct'] = {
+        passed: sniperOk,
+        message: `Sniper activity: ${risk.sniper_pct.toFixed(1)}%`,
+        critical: false,
+      };
+      if (!sniperOk) {
+        result.warnings.push(`High sniper activity (${risk.sniper_pct.toFixed(1)}%)`);
+      }
+
+      // Check 4: Suspicious wallet concentration (warning only)
+      const suspiciousOk = risk.suspicious_pct <= OKX_CONFIG.MAX_SUSPICIOUS_PCT;
+      result.checks['okx_suspicious_pct'] = {
+        passed: suspiciousOk,
+        message: `Suspicious wallets: ${risk.suspicious_pct.toFixed(1)}%`,
+        critical: false,
+      };
+      if (!suspiciousOk) {
+        result.warnings.push(`High suspicious wallet concentration (${risk.suspicious_pct.toFixed(1)}%)`);
+      }
+
+      // Check 5: Dev sold all (CRITICAL)
+      const devSafe = !risk.dev_sold_all;
+      result.checks['okx_dev_sold_all'] = {
+        passed: devSafe,
+        message: devSafe ? 'Dev has not sold all tokens' : 'Dev has sold all tokens (RUG PULL RISK)',
+        critical: true,
+      };
+      if (!devSafe) {
+        result.errors.push('Dev has sold all tokens - high rug pull risk');
+      }
+
+      // Check 6: Wash trading detected (CRITICAL)
+      const noWashTrading = !risk.wash_trading_detected;
+      result.checks['okx_wash_trading'] = {
+        passed: noWashTrading,
+        message: noWashTrading ? 'No wash trading detected' : 'Wash trading detected',
+        critical: true,
+      };
+      if (!noWashTrading) {
+        result.errors.push('Wash trading detected by OKX');
+      }
+
+      // Positive signal: Smart money buying
+      if (risk.smart_money_buy) {
+        result.warnings.push('Positive: Smart money buying detected');
+      }
+
+      logger.debug(
+        `Tier 3 (OKX): risk=${risk.risk_level}, bundle=${risk.bundle_pct.toFixed(1)}%, ` +
+        `sniper=${risk.sniper_pct.toFixed(1)}%, suspicious=${risk.suspicious_pct.toFixed(1)}%`,
+      );
+    } catch (error) {
+      // Non-fatal: OKX failure should not block the whole check
+      logger.debug(`Tier 3 checks failed (non-fatal): ${error}`);
+      result.warnings.push('OKX risk check unavailable');
     }
   }
 
